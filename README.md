@@ -25,6 +25,35 @@ Automate your Edmentum experience for free. An open-source userscript designed t
 
 ---
 
+## 📸 Preview & Screenshots
+
+<details>
+<summary><b>Click to view screenshots</b></summary>
+<br>
+
+### 1. Features Tab
+<img width="373" height="737" alt="Screenshot 2026-05-21 195919" src="https://github.com/user-attachments/assets/a489b41d-c4a6-4f80-be08-bad31156bd80" />
+
+### 2. API Tab
+<img width="376" height="662" alt="Screenshot 2026-05-21 195930" src="https://github.com/user-attachments/assets/175020ab-1453-4b5b-921b-0797fe542780" />
+
+### 3. About Tab
+
+<img width="370" height="812" alt="Screenshot 2026-05-21 195942" src="https://github.com/user-attachments/assets/487f36e5-6139-4f3a-bf2c-b5a601231c93" />
+
+### 4. Auto Answer In Action
+
+<img width="1373" height="837" alt="Screenshot 2026-05-21 200120" src="https://github.com/user-attachments/assets/9d9a39f7-2e07-4e80-9539-14253126073f" />
+
+
+### 5. Test result screen
+<img width="963" height="744" alt="Screenshot 2026-05-21 200154" src="https://github.com/user-attachments/assets/08437802-2e0f-4a88-ac02-bc10d0126668" />
+
+
+</details>
+
+---
+
 ## 🛠️ Setup Instructions
 
 1. Install a userscript manager extension like **Tampermonkey** in your browser. (Other script managers MAY work, but have not been tested.)
