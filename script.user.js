@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Edmentum Solver - V1.0.0
+// @name         Edmentum Solver - V1.0.1
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  Automates Edmentum using your own API keys for completely free. this ONLY works on standard Edmentum classes, it won't work on other platforms Edmentum has like Apex learning. For more info, check the greasyfork page.
+// @version      1.0.1
+// @description  Automates Edmentum.
 // @author       Floor
 // @match        *://*.apps.elf.edmentum.com/*
 // @match        *://app.edmentum.com/*
@@ -16,8 +16,8 @@
 // @connect      api.cerebras.ai
 // @connect      api.groq.com
 // @run-at       document-start
-// @downloadURL  https://update.greasyfork.org/scripts/578793/Edmentum%20Solver%20-%20V100.user.js
-// @updateURL    https://update.greasyfork.org/scripts/578793/Edmentum%20Solver%20-%20V100.meta.js
+// @downloadURL  https://update.greasyfork.org/scripts/578793/script.user.js
+// @updateURL    https://update.greasyfork.org/scripts/578793/script.meta.js
 // ==/UserScript==
 
 (function() {
@@ -4161,7 +4161,7 @@ ${data.question}${imgSection}
             const autoHideActive = Ed.Config.get("AUTOHIDE_ENABLED", false) ? 'active' : '';
 
             p.innerHTML = `
-                <div class="header"><div class="logo">E</div><div class="title">Edmentum Solver <span id="version-tag" style="font-size: 10px; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; margin-left: 8px; font-weight: 500;">v1.0.0</span></div><div class="header-btns"><button class="header-btn" id="collapse-btn">—</button><button class="header-btn" id="hide-btn">✕</button></div></div>
+                <div class="header"><div class="logo">E</div><div class="title">Edmentum Solver <span id="version-tag" style="font-size: 10px; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; margin-left: 8px; font-weight: 500;">v1.0.1</span></div><div class="header-btns"><button class="header-btn" id="collapse-btn">—</button><button class="header-btn" id="hide-btn">✕</button></div></div>
                 <div id="panel-body">
                    <div class="tabs">
                         <div class="tab active" data-tab="features"><svg viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Features</div>
