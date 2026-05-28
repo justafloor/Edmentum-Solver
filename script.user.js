@@ -15,6 +15,8 @@
 // @grant        GM_xmlhttpRequest
 // @connect      api.cerebras.ai
 // @run-at       document-start
+// @downloadURL https://update.greasyfork.org/scripts/578793/Edmentum%20Solver%20-%20V110.user.js
+// @updateURL https://update.greasyfork.org/scripts/578793/Edmentum%20Solver%20-%20V110.meta.js
 // ==/UserScript==
 
 (function() {
