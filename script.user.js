@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Edmentum Solver - V1.0.1
+// @name         Edmentum Solver - V1.1.0
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1
+// @version      1.1.0
 // @description  Automates Edmentum.
 // @author       Floor
 // @match        *://*.apps.elf.edmentum.com/*
@@ -14,10 +14,7 @@
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @connect      api.cerebras.ai
-// @connect      api.groq.com
 // @run-at       document-start
-// @downloadURL  https://update.greasyfork.org/scripts/578793/script.user.js
-// @updateURL    https://update.greasyfork.org/scripts/578793/script.meta.js
 // ==/UserScript==
 
 (function() {
@@ -50,7 +47,8 @@
             manuallyPausedSubmission: false,
             hasConfirmedSubmission: false,
             notifiedAudioBlocked: false,
-            activeProvider: null,
+            activeProvider: 'cerebras',
+            apiTimestamps: [],
             status: 'IDLE'
         },
         Utils: {},
@@ -68,11 +66,9 @@
     // CONFIGURATION
     // ========================================================================
     Ed.Config = {
-        CEREBRAS_MODEL: "gpt-oss-120b",
-        GROQ_MODEL: "openai/gpt-oss-120b",
+        CEREBRAS_MODEL: "zai-glm-4.7",
         API_ENDPOINTS: {
-            CEREBRAS: "https://api.cerebras.ai/v1/chat/completions",
-            GROQ: "https://api.groq.com/openai/v1/chat/completions"
+            CEREBRAS: "https://api.cerebras.ai/v1/chat/completions"
         },
 
         encode: (s) => btoa(unescape(encodeURIComponent(s))),
@@ -370,10 +366,42 @@
     // AI ENGINE
     // ========================================================================
     Ed.AI = {
-        validateKey: (provider, key) => {
+       checkRateLimit: async (estimatedTokens = 6000) => {
+            while (true) {
+                const now = Date.now();
+                if (!Ed.State.apiTimestamps) {
+                    Ed.State.apiTimestamps = [];
+                }
+                // Filter out entries older than 60 seconds
+                Ed.State.apiTimestamps = Ed.State.apiTimestamps.filter(item => now - item.timestamp < 60000);
+
+                const currentRPM = Ed.State.apiTimestamps.length;
+                const currentTPM = Ed.State.apiTimestamps.reduce((sum, item) => sum + item.tokens, 0);
+
+                // Ensure both Requests Per Minute (5) and Tokens Per Minute (30,000) are clear
+                if (currentRPM < 5 && (currentTPM + estimatedTokens) < 30000) {
+                    break;
+                }
+
+                const oldest = Ed.State.apiTimestamps[0];
+                const waitMs = oldest ? (oldest.timestamp + 60000) - now : 1000;
+
+                if (waitMs > 0) {
+                    const waitSecs = Math.ceil(waitMs / 1000);
+                    const reason = currentRPM >= 5 ? "RPM limit (5 req/min)" : "TPM limit (30k tokens/min)";
+                    Ed.UI.showToast(`Rate limit reached: ${reason}. Pausing for ${waitSecs}s to continue...`, 2000);
+                    await Ed.Utils.delayAsync(1000); // Ticks countdown smoothly every second
+                } else {
+                    break;
+                }
+            }
+        },
+
+        validateKey: async (provider, key) => {
+            await Ed.AI.checkRateLimit();
             return new Promise((resolve) => {
-                const url = provider === 'cerebras' ? Ed.Config.API_ENDPOINTS.CEREBRAS : Ed.Config.API_ENDPOINTS.GROQ;
-                const model = provider === 'cerebras' ? Ed.Config.CEREBRAS_MODEL : Ed.Config.GROQ_MODEL;
+                const url = Ed.Config.API_ENDPOINTS.CEREBRAS;
+                const model = Ed.Config.CEREBRAS_MODEL;
 
                 GM_xmlhttpRequest({
                     method: "POST",
@@ -385,7 +413,8 @@
                     data: JSON.stringify({
                         model: model,
                         messages:[{ role: "user", content: "test" }],
-                        max_tokens: 1
+                        max_completion_tokens: 1,
+                        reasoning_effort: "none"
                     }),
                     timeout: 15000,
                     onload: (response) => {
@@ -416,11 +445,28 @@
         },
 
         cleanAIResponse: (text) => {
-            // Target the strict final answer block first
+            // 1. Extract the actual final answer appended after the model's native thinking phase
+            if (text.includes('</think>')) {
+                const parts = text.split('</think>');
+                const last = parts[parts.length - 1].trim();
+                text = last ? last : parts[0];
+            } else if (text.includes('</thinking>')) {
+                const parts = text.split('</thinking>');
+                const last = parts[parts.length - 1].trim();
+                text = last ? last : parts[0];
+            } else if (text.includes('</reasoning>')) {
+                const parts = text.split('</reasoning>');
+                const last = parts[parts.length - 1].trim();
+                text = last ? last : parts[0];
+            }
+
+            // 2. Target the strict final answer block next
             const finalAnswerMatch = text.match(/\[FINAL ANSWER\]([\s\S]*?)(?:\[\/FINAL ANSWER\]|$)/i);
             let extracted = finalAnswerMatch ? finalAnswerMatch[1] : text;
 
+            // 3. Sanitize the output
             return extracted
+                .replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '')
                 .replace(/<<think(?:ing)?[\s\S]*?<\/think(?:ing)?>/gi, '')
                 .replace(/<<reasoning[\s\S]*?<\/reasoning>/gi, '')
                 .replace(/\[REASONING\][\s\S]*?\[\/REASONING\]/gi, '')
@@ -434,47 +480,69 @@
         },
 
         askAI: async (data) => {
-            const keys = { cerebras: Ed.Config.safeGetKey('cerebras_key'), groq: Ed.Config.safeGetKey('groq_key') };
-            const reasoningEffort = Ed.Config.get('REASONING_LEVEL', 'medium');
+            const keys = { cerebras: Ed.Config.safeGetKey('cerebras_key') };
+            if (!Ed.State.answerRunning) throw new Error('STOPPED');
 
-            let attempt = 0;
-
-            if (!Ed.State.activeProvider) {
-                Ed.State.activeProvider = keys.cerebras ? 'cerebras' : (keys.groq ? 'groq' : null);
+            if (!keys.cerebras) {
+                Ed.UI.showToast(`Cerebras API key missing`, 3000);
+                await Ed.Utils.delayAsync(3000);
+                return;
             }
 
             while (true) {
                 if (!Ed.State.answerRunning) throw new Error('STOPPED');
 
-                let currentProvider = Ed.State.activeProvider;
+                const key = keys.cerebras;
+                const model = Ed.Config.CEREBRAS_MODEL;
+                const url = Ed.Config.API_ENDPOINTS.CEREBRAS;
 
-                if (!currentProvider) {
-                    Ed.UI.showToast(`API key missing`, 3000);
-                    await Ed.Utils.delayAsync(3000);
-                    continue;
-                }
-
-                const key = keys[currentProvider];
-                const model = currentProvider === 'cerebras' ? Ed.Config.CEREBRAS_MODEL : Ed.Config.GROQ_MODEL;
-                const url = currentProvider === 'cerebras' ? Ed.Config.API_ENDPOINTS.CEREBRAS : Ed.Config.API_ENDPOINTS.GROQ;
+               // Estimate prompt context length to check Tokens Per Minute limitations pre-request
+                const promptContent = Ed.Parsers.buildPrompt(data);
+                const estimatedTokens = Math.ceil(promptContent.length / 3) + 8192;
 
                 try {
-                    Ed.UI.showToast(`Asking ${currentProvider}...`, 2000);
+                    await Ed.AI.checkRateLimit(estimatedTokens);
+                    if (!Ed.State.answerRunning) throw new Error('STOPPED');
+
+                    Ed.UI.showToast(`Asking Cerebras GLM 4.7...`, 3000);
+
+                    // Prints the prompt directly to your browser's Developer Console
+                    Ed.Utils.log.info("Cerebras Outgoing Prompt:", promptContent);
 
                     const controller = new AbortController();
                     const timeoutId = setTimeout(() => controller.abort(), 60000);
 
-                    const body = {
-                        model: model,
-                       messages: [
-                            { role: 'system', content: 'You are an elite, highly logical expert tutor for US grades 6-12. Your goal is 100% accuracy on standard math, science, ELA, social studies, and history problems.\n\nBecause you require deep computational reasoning to solve complex problems, you MUST "think out loud" in a designated scratchpad before providing your final answer.\n\nYou must format your response using EXACTLY this two-part structure:\n\n[REASONING]\nAnalyze the question deeply here. Re-read it to ensure no misinterpretations. If diagrams or images are described via text clues, mentally reconstruct them with precise geometric or contextual spatial awareness. Apply rigorous, step-by-step logical deduction, formulate your equations, and double-check your math. Use as many tokens as you need to guarantee 100% accuracy.\n[/REASONING]\n\n[FINAL ANSWER]\nThis block MUST contain ONLY the final answer in the exact format requested. NO explanations. NO introductory text. NO punctuation outside the answer. NO markdown code blocks.\n- Single choice: output exactly one capital letter (e.g., B).\n- Multiple choice: output capital letters separated by commas (e.g., A,C).\n- Math/Numbers: output only the exact numbers/expressions separated by commas (e.g., 5,12.5,-3).\n- Drag/Drop: output the exact tile text separated by commas.\n[/FINAL ANSWER]' },
-                            { role: 'user', content: Ed.Parsers.buildPrompt(data) }
-                        ],
-                        max_tokens: 16384,
-                        temperature: 0,
-                        reasoning_effort: reasoningEffort
-                    };
+                    const globalReasoningEnabled = Ed.Config.get("CEREBRAS_REASONING", true);
+// Disable reasoning for this specific request if the AI was too chatty and kept getting truncated
+const useReasoning = globalReasoningEnabled && !data._forceNoReasoning;
 
+// Dynamic system prompt modifications if a truncation event was recorded
+let systemContent = 'You are Z.ai GLM-4.7, an elite, highly logical expert tutor optimized for US grades 6-12 across all academic subjects (Mathematics, Science, English Language Arts, Social Studies, and History). Your goal is absolute 100% accuracy.';
+if (useReasoning) {
+systemContent += '\nSince reasoning is enabled, analyze the question deeply inside your thinking phase. Carefully parse all questions, diagrams, and options. Verify math calculations and context before formulating the final answer.';
+} else {
+systemContent += '\nReasoning is disabled for this attempt to prevent length cutoffs. Provide the most accurate answer directly. Carefully parse all questions, diagrams, and options.';
+}
+if (data._shortRetry) {
+                        systemContent += '\n\nCRITICAL CONSTRAINTS: Your previous response ran too long and got cut off. You MUST be extremely concise on this attempt. Keep your [REASONING] block to under 2 sentences. Deliver your [FINAL ANSWER] as fast as possible to avoid truncation.';
+                    }
+
+                    systemContent += '\n\nYou must structure your final content output using EXACTLY this two-part format:\n\n[REASONING]\n(Provide a brief explanation of your logical deduction steps here to verify accuracy)\n[/REASONING]\n\n[FINAL ANSWER]\n(Provide ONLY the final answer as requested, with NO other text or formatting, matching the options exactly)\n- Single choice: output exactly one capital letter (e.g., B).\n- Multiple choice: output capital letters separated by commas (e.g., A,C).\n- Math/Numbers: output only the exact numbers/expressions separated by commas (e.g., 5,12.5,-3).\n- Drag/Drop: output the exact tile text separated by commas.\n[/FINAL ANSWER]';
+
+                    const body = {
+model: model,
+messages: [
+{ role: 'system', content: systemContent },
+{ role: 'user', content: promptContent }
+],
+max_completion_tokens: 8192,
+temperature: 0
+};
+if (!useReasoning) {
+body.reasoning_effort = "none";
+} else {
+body.reasoning_format = "raw";
+}
                     const res = await fetch(url, {
                         method: 'POST',
                         signal: controller.signal,
@@ -503,11 +571,30 @@
                         throw new Error('No choices array in response');
                     }
 
-                    const choice0 = json.choices[0];
+                   const choice0 = json.choices[0];
 
-                    if (choice0?.finish_reason === 'length') {
-                        throw new Error('Response truncated (length). Retrying with more tokens...');
-                    }
+      if (choice0?.finish_reason === 'length') {
+    // Track how many times we've attempted a shorter prompt
+    data._shortRetryCount = (data._shortRetryCount || 0) + 1;
+
+    if (data._shortRetryCount <= 2) {
+        // Flag to trigger the concise restriction on the next loop retry
+        data._shortRetry = true;
+        throw new Error(`Response truncated (length). Retrying with shorter prompt (Attempt ${data._shortRetryCount}/2)...`);
+    } else if (globalReasoningEnabled && !data._forceNoReasoning) {
+        // If it still truncates after 2 short retries, disable reasoning for this specific question
+        data._forceNoReasoning = true;
+        data._shortRetryCount = 0; // Reset counter to allow 2 more attempts without reasoning
+        data._shortRetry = true;
+        Ed.UI.showToast(`AI too chatty. Disabling reasoning for this question...`, 3000);
+        throw new Error('Response truncated. Disabling reasoning and retrying...');
+    } else {
+        // If it STILL truncates with reasoning disabled, force parse the partial response
+        Ed.Utils.log.warn(`[AI Warning] Response truncated with reasoning disabled. Forcing parse of partial response...`);
+        Ed.UI.showToast(`AI cut off again. Using partial answer...`, 3000);
+        // Let the code fall through to parse the partial response instead of throwing an error
+    }
+}
 
                     let answer = choice0?.message?.content
                         || choice0?.text
@@ -518,39 +605,55 @@
                         || json.choices?.[0]?.delta?.content
                         || '';
 
-                    if (!answer && typeof choice0 === 'object') {
-                        const skipKeys = ['finish_reason', 'index', 'logprobs', 'stop_reason'];
-                        for (const k of Object.keys(choice0)) {
-                            if (skipKeys.includes(k)) continue;
-                            if (typeof choice0[k] === 'string' && choice0[k].trim()) {
-                                answer = choice0[k];
-                                break;
-                            }
-                            if (choice0[k] && typeof choice0[k].content === 'string' && choice0[k].content.trim()) {
-                                answer = choice0[k].content;
-                                break;
-                            }
-                        }
-                    }
-
                     const trimmed = Ed.AI.cleanAIResponse(answer || '');
-                    if (!trimmed || ['length', 'stop', 'content_filter'].includes(trimmed.toLowerCase())) {
+                    if (!trimmed) {
                         throw new Error('Empty or invalid response content');
                     }
 
-                    return { answer: trimmed, provider: currentProvider };
+                    // Prints the cleaned answer directly to your browser's Developer Console
+                    Ed.Utils.log.info("Cerebras Cleaned Response:", trimmed);
+
+                    // Record real usage to prevent exceeding sliding TPM window
+                    const actualTokens = json.usage?.total_tokens || estimatedTokens;
+                    Ed.State.apiTimestamps.push({ timestamp: Date.now(), tokens: actualTokens });
+
+                    return { answer: trimmed, provider: 'cerebras' };
                 } catch (e) {
                     if (e.message === 'STOPPED') throw e;
-                    let otherProvider = currentProvider === 'cerebras' ? 'groq' : 'cerebras';
-                    if (keys[otherProvider]) {
-                        Ed.State.activeProvider = otherProvider;
-                        Ed.UI.showToast(`${currentProvider} failed, switching to ${otherProvider}...`, 3000);
+
+                    // Capture high traffic / queue congestion rate limits
+                    const isQueueExceeded = e.message.includes('queue_exceeded') ||
+                                            e.message.includes('too_many_requests_error') ||
+                                            e.message.includes('high traffic');
+
+                    // Explicitly capture Cerebras token quota exceeded errors
+                    const isTokenQuota = e.message.includes('token_quota_exceeded') ||
+                                         e.message.includes('too_many_tokens_error') ||
+                                         e.message.includes('Tokens per minute limit exceeded');
+
+                    if (isQueueExceeded) {
+                        Ed.Utils.log.warn(`[Cerebras Queue Limit] High traffic. Pausing 10s...`, e);
+
+                        // 10 second ticking countdown for quick queue resets
+                        for (let i = 10; i > 0; i--) {
+                            if (!Ed.State.answerRunning) throw new Error('STOPPED');
+                            Ed.UI.showToast(`Cerebras busy (high traffic). Waiting ${i}s...`, 1200);
+                            await Ed.Utils.delayAsync(1000);
+                        }
+                    } else if (isTokenQuota) {
+                        Ed.Utils.log.warn(`[Cerebras TPM Limit] Quota exceeded. Pausing 60s for window reset...`, e);
+
+                        // Counts down smoothly and displays a ticking toast every second
+                        for (let i = 60; i > 0; i--) {
+                            if (!Ed.State.answerRunning) throw new Error('STOPPED');
+                            Ed.UI.showToast(`TPM Limit Exceeded. Pausing for ${i}s...`, 1200);
+                            await Ed.Utils.delayAsync(1000);
+                        }
                     } else {
-                        Ed.UI.showToast(`${currentProvider} error. Retrying...`, 3000);
+                        Ed.UI.showToast(`Cerebras error. Retrying...`, 3000);
+                        Ed.Utils.log.error(`[AI Error]`, e);
+                        await Ed.Utils.delayAsync(4000);
                     }
-                    Ed.Utils.log.error(`[AI Error ${currentProvider}]`, e);
-                    attempt++;
-                    await Ed.Utils.delayAsync(3000);
                 }
             }
         },
@@ -588,6 +691,37 @@
     Ed.Parsers = {
         cleanText: (str) => {
             return (str || '').replace(/\s+/g, ' ').trim();
+        },
+
+        getTopicContext: (doc) => {
+            let topic = '';
+
+            // 1. Check practice topbar thspan sentence
+            const thspan = doc.querySelector('thspan.thsentence, .thsentence');
+            if (thspan) {
+                const t = thspan.textContent.trim().replace(/:$/, '');
+                if (t && t.length > 2 && t.length < 100) topic = t;
+            }
+
+            // 2. Check quiz/mastery test title h1
+            if (!topic) {
+                const testTitle = doc.querySelector('#test-title, .test-title, h1[id="test-title"]');
+                if (testTitle) {
+                    const t = testTitle.textContent.trim().replace(/:\s*Mastery\s*Test/i, '').replace(/:$/, '');
+                    if (t && t.length > 2 && t.length < 100) topic = t;
+                }
+            }
+
+            // 3. Fallback to generic module header title
+            if (!topic) {
+                const header = doc.querySelector('.header-title, .module-title');
+                if (header) {
+                    const t = header.textContent.trim().replace(/:$/, '');
+                    if (t && t.length > 2 && t.length < 100) topic = t;
+                }
+            }
+
+            return topic;
         },
 
         normalizeMathText: (text) => {
@@ -652,6 +786,9 @@
             const prompt = Ed.Parsers.getVisibleText(promptEl);
             const stem = Ed.Parsers.getVisibleText(stemEl);
 
+            // Retrieve topic or module context to prime the AI
+            const topic = Ed.Parsers.getTopicContext(doc);
+
             // Search the entire document for reading passages or poems
             let passage = '';
             const passageEl = doc.querySelector('.passage, .reading-passage, [class*="passage"]');
@@ -660,6 +797,9 @@
             }
 
             let fullText = '';
+            if (topic) {
+                fullText += `=== SUBJECT/TOPIC CONTEXT: ${topic} ===\n\n`;
+            }
             if (passage && passage.length > 5) {
                 fullText += '=== READING PASSAGE / CONTEXT ===\n' + passage + '\n=================================\n\n';
             }
@@ -671,7 +811,6 @@
         getImageInfo: (widget, doc) => {
             const images = [];
             const container = Ed.Parsers.findQuestionContainer(widget, doc);
-            const win = doc.defaultView || window;
 
             function getFilenameHint(url) {
                 if (!url) return '';
@@ -917,8 +1056,12 @@
                 for (const mcq of mcqs) {
                     if (!Ed.Utils.isVisible(mcq, d)) continue;
                     const question = Ed.Parsers.extractQuestionText(mcq, d);
-                    const choices = Array.from(mcq.querySelectorAll('.multichoice-choice')).map(c => {
-                        const letter = c.querySelector('.multichoice-answer-letter')?.innerText?.trim() || '';
+                    const choices = Array.from(mcq.querySelectorAll('.multichoice-choice')).map((c, idx) => {
+                        let letter = c.querySelector('.multichoice-answer-letter')?.innerText?.trim() || '';
+                        // Guard: Generate letter fallback dynamically if DOM node text is missing
+                        if (!letter) {
+                            letter = String.fromCharCode(65 + idx);
+                        }
                         const text = Ed.Parsers.getChoiceText(c.querySelector('.content-inner') || c);
                         const id = c.dataset.identifier;
                         return { letter, text, id };
@@ -1371,51 +1514,80 @@
                 strictSuffix = `\n\nCRITICAL: Your previous response contained extra text, formatting, or explanation and could not be parsed. This time output ONLY the raw answer with no labels, no markdown, no sentences, and no punctuation around it. Just the answer exactly as requested.`;
             }
 
+            // Injected instruction to force short reasoning on cutoff recovery
+            let shortSuffix = '';
+            if (data._shortRetry) {
+                shortSuffix = `\n\nCRITICAL WARNING: Your previous response was cut off because your reasoning was too long. Do not write a long reasoning block this time. Limit your [REASONING] section to a maximum of 2 sentences and write the [FINAL ANSWER] immediately.`;
+            }
+
+            // Combined suffixes to keep prompt code clean
+            const suffix = strictSuffix + shortSuffix;
+
             if (data.type === 'mcq') {
                 let prompt = wrongFeedback + `Answer this multiple choice question with ONLY the letter (A, B, C, D, etc.) of the correct choice.\n\nQuestion:\n${data.question}${imgSection}\n\nChoices:\n`;
                 data.choices.forEach(c => {
                     prompt += `${c.letter}) ${c.text}\n`;
                 });
-                prompt += `\nRespond with ONLY the letter. No explanation. No punctuation. No extra text of any kind.` + strictSuffix;
-                return prompt;
-            }
-
-            if (data.type === 'multiresponse') {
-                let prompt = wrongFeedback + `This is a multiple-response question. Select ALL correct answers. There may be more than one correct answer.\n\nQuestion:\n${data.question}${imgSection}\n\nChoices:\n`;
-                data.choices.forEach(c => {
-                    prompt += `${c.letter}) ${c.text}\n`;
-                });
-                prompt += `\nRespond with ONLY the letters of all correct choices, separated by commas.\nDo not include any explanations or extra text.\nExample: A,C,D` + strictSuffix;
-                return prompt;
-            }
-
-            if (data.type === 'hottext') {
-                let prompt = wrongFeedback + `This is a text-selection question. Read the instructions carefully to determine if you need to select ONE option or MULTIPLE options.\nIf it's a grid/table with multiple statements to evaluate (like True/False for each row), you MUST provide exactly one answer for EVERY statement/row. Select ALL applicable letters overall to fill the table.\nIf the instructions say "Select the correct texts" or "Select all", choose MULTIPLE.\n\nQuestion:\n${data.question}${imgSection}\n\nChoices:\n`;
-                data.choices.forEach(c => {
-                    prompt += `${c.letter}) ${c.text}\n`;
-                });
-                prompt += `\nRespond with ONLY the letter(s) of the correct choice(s). If multiple, separate with commas (e.g., A,D,E). If one, just the letter (e.g., B). No explanations.` + strictSuffix;
-                return prompt;
-            }
-
-            if (data.type === 'ggm') {
-                let prompt = wrongFeedback + `You are answering a drag-and-drop math question.\n\nQuestion:\n${data.question}${imgSection}\n\n`;
-                prompt += `Available draggable tiles:\n`;
-                data.draggables.forEach(t => {
-                    prompt += `- ${t.text}\n`;
-                });
-                prompt += `\nDrop zones (in order):\n`;
-                data.droppables.forEach((z, i) => {
-                    const labelInfo = z.label && !z.label.includes('Empty') ? ` [${z.label}]` : '';
-                    prompt += `${i + 1}. ${z.positionDesc}${labelInfo}\n`;
-                });
-                prompt += `\nTell me which tile text belongs in each drop zone.\n`;
-                prompt += `Respond with ONLY the tile TEXT VALUES, separated by commas, in the same order as the drop zones above.\n`;
-                prompt += `Do not include any reasoning, explanations, or extra text.\n`;
-                prompt += `Example: 13√3, 13  OR  [Image: tile.png], [Image: tile2.png]\n`;
-                prompt += `Use the exact text from the available tiles listed above.` + strictSuffix;
-                return prompt;
-            }
+                       prompt += `
+Respond with ONLY the letter. No explanation. No punctuation. No extra text of any kind.` + suffix;
+       return prompt;
+   }
+   if (data.type === 'multiresponse') {
+       let prompt = wrongFeedback + `Answer this multiple response question. Select ALL correct options.
+Question:
+${data.question}${imgSection}
+Choices:
+`;
+       data.choices.forEach(c => {
+           prompt += `${c.letter}) ${c.text}
+`;
+       });
+       prompt += `
+Respond with ONLY the letters of the correct choices, separated by commas (e.g., A,C). No explanation. No extra text.` + suffix;
+       return prompt;
+   }
+   if (data.type === 'hottext') {
+       let prompt = wrongFeedback + `Answer this text selection question. Select the correct phrase(s) from the options.
+Question:
+${data.question}${imgSection}
+Options:
+`;
+       data.choices.forEach(c => {
+           prompt += `${c.letter}) ${c.text}
+`;
+       });
+       prompt += `
+Respond with ONLY the letter(s) of the correct option(s), separated by commas if multiple. No explanation. No extra text.` + suffix;
+       return prompt;
+   }
+      if (data.type === 'ggm') {
+       let prompt = wrongFeedback + `You are answering a drag-and-drop categorization question.
+Question:
+${data.question}${imgSection}
+`;
+       prompt += `Available draggable tiles:
+`;
+       data.draggables.forEach(t => {
+           prompt += `- ${t.text}
+`;
+       });
+       prompt += `
+Drop zones (categories):
+`;
+       data.droppables.forEach((z, i) => {
+           const labelInfo = z.label && !z.label.includes('Empty') ? ` [${z.label}]` : '';
+           prompt += `${i + 1}. ${z.positionDesc}${labelInfo}
+`;
+       });
+       prompt += `
+CRITICAL: Multiple tiles can belong to the SAME drop zone. You must categorize EVERY single tile. Do not leave any tiles unused.
+Respond with ONLY the mappings in this exact format:
+Zone 1: tile text, tile text
+Zone 2: tile text, tile text
+(Use the exact tile text from the list above. Separate multiple tiles in the same zone with commas.)
+Do not include any reasoning, explanations, or extra text.` + strictSuffix;
+       return prompt;
+   }
 
             if (data.type === 'mpsimple') {
                 let prompt = wrongFeedback + `You are answering a drag-and-drop pairing question.\n\nQuestion:\n${data.question}${imgSection}\n\n`;
@@ -1508,20 +1680,28 @@ ${data.question}${imgSection}
         parseAnswer: (text, choices) => {
             const cleaned = Ed.AI.cleanAIResponse(text);
             const normalized = cleaned.toUpperCase().replace(/[.*)\]]/g, '').trim();
+
+            // 1. Exact match of the letter
             const exact = choices.find(c => {
                 const letter = c.letter.replace(/[.\s)]/g, '').toUpperCase();
-                return normalized === letter;
+                return letter && normalized === letter; // Guard: skip empty strings
             });
             if (exact) return exact;
 
+            // 2. Strict word boundary match (prevents matching letter "A" inside words like "ANSWER")
             for (const c of choices) {
                 const letter = c.letter.replace(/[.\s)]/g, '').toUpperCase();
-                if (normalized.includes(letter)) return c;
-            }
-            for (const c of choices) {
-                if (normalized.includes(c.id.toUpperCase())) return c;
+                if (!letter) continue; // Guard: skip empty strings
+                const regex = new RegExp('\\b' + letter + '\\b');
+                if (regex.test(normalized)) return c;
             }
 
+            // 3. Match using ID
+            for (const c of choices) {
+                if (c.id && normalized.includes(c.id.toUpperCase())) return c;
+            }
+
+            // 4. Exact text fallback
             const lowerCleaned = cleaned.toLowerCase().trim();
             for (const c of choices) {
                 const choiceText = (c.text || '').toLowerCase().trim();
@@ -1537,17 +1717,21 @@ ${data.question}${imgSection}
             const parts = normalized.split(/[,;]/).map(p => p.trim().replace(/[.*)\]]/g, '')).filter(Boolean);
 
             for (const part of parts) {
+                // Exact letter match
                 const exact = choices.find(c => {
                     const letter = c.letter.replace(/[.\s)]/g, '').toUpperCase();
-                    return part === letter;
+                    return letter && part === letter; // Guard: skip empty strings
                 });
                 if (exact && !results.find(r => r.id === exact.id)) {
                     results.push(exact);
                     continue;
                 }
+                // Word boundary check (ensures target letter is standalone)
                 for (const c of choices) {
                     const letter = c.letter.replace(/[.\s)]/g, '').toUpperCase();
-                    if (part.includes(letter) && !results.find(r => r.id === c.id)) {
+                    if (!letter) continue; // Guard: skip empty strings
+                    const regex = new RegExp('\\b' + letter + '\\b');
+                    if (regex.test(part) && !results.find(r => r.id === c.id)) {
                         results.push(c);
                         break;
                     }
@@ -1609,50 +1793,53 @@ ${data.question}${imgSection}
             return null;
         },
 
-        parseGGMAnswer: (text, data) => {
-            const cleaned = Ed.AI.cleanAIResponse(text);
-            const mapping = {};
+       parseGGMAnswer: (text, data) => {
+    const cleaned = Ed.AI.cleanAIResponse(text);
+    const mapping = {}; // Will store { dropId: [tileId1, tileId2] }
 
-            const idParts = cleaned.split(/[,;]/);
-            for (const part of idParts) {
-                if (part.includes(':')) {
-                    const [dropId, tileId] = part.trim().split(':');
-                    if (dropId && tileId) {
-                        const dId = dropId.trim();
-                        const tId = tileId.trim();
-                        const dropExists = data.droppables.some(z => z.id === dId);
-                        const tileExists = data.draggables.some(t => t.id === tId);
-                        if (dropExists && tileExists) mapping[dId] = tId;
+    // Initialize mapping arrays for each drop zone
+    data.droppables.forEach(z => { mapping[z.id] = []; });
+
+    // Split response by lines to handle "Zone X: tile, tile" format
+    const lines = cleaned.split(/\n/).map(l => l.trim()).filter(Boolean);
+
+    for (const line of lines) {
+        // Match patterns like "Zone 1: tile text, tile text" or "1: tile text"
+        const zoneMatch = line.match(/^(?:zone|drop\s*zone|category)\s*(\d+)\s*[:\-]\s*(.*)/i);
+        if (zoneMatch) {
+            const zoneIndex = parseInt(zoneMatch[1]) - 1;
+            const tileTexts = zoneMatch[2].split(/[,;]/).map(t => t.trim()).filter(Boolean);
+
+            if (zoneIndex >= 0 && zoneIndex < data.droppables.length) {
+                const dropId = data.droppables[zoneIndex].id;
+                for (const tText of tileTexts) {
+                    const tile = Ed.Parsers.findBestTile(tText, data.draggables);
+                    if (tile && !mapping[dropId].includes(tile.id)) {
+                        mapping[dropId].push(tile.id);
                     }
                 }
             }
-            if (Object.keys(mapping).length === data.droppables.length) return mapping;
+        }
+    }
 
-            let values = cleaned.split(/[\n,;]/).map(l => {
-                return l.replace(/^[^a-zA-Z0-9√\-\[\]:]*/, '')
-                        .replace(/^Zone\s*\d+[:.)]?\s*/, '')
-                        .replace(/^Drop\s*zone\s*\d+[:.)]?\s*/i, '')
-                        .replace(/^Tile\s*\d+[:.)]?\s*/i, '')
-                        .replace(/^(?:the\s+)?(?:answer\s+is?:?\s*)?/i, '')
-                        .trim();
-            }).filter(Boolean);
-
-            values = values.filter(v => {
-                const vl = v.toLowerCase();
-                return data.draggables.some(t => {
-                    const tl = t.text.toLowerCase();
-                    return tl === vl || tl.includes(vl) || vl.includes(tl);
-                }) || (v.length > 1 && !['answer','option','tile','zone','drop','correct','the','and','is','to','of','a','an'].includes(vl));
-            });
-
-            for (let i = 0; i < data.droppables.length && i < values.length; i++) {
-                const val = values[i];
-                const tile = Ed.Parsers.findBestTile(val, data.draggables);
-                if (tile) mapping[data.droppables[i].id] = tile.id;
+    // Fallback: If AI just listed tiles sequentially without zone labels
+    if (Object.values(mapping).every(arr => arr.length === 0)) {
+        const allTexts = cleaned.split(/[,;\n]/).map(t => t.trim()).filter(Boolean);
+        let zoneIdx = 0;
+        for (const tText of allTexts) {
+            const tile = Ed.Parsers.findBestTile(tText, data.draggables);
+            if (tile) {
+                const dropId = data.droppables[zoneIdx % data.droppables.length].id;
+                if (!mapping[dropId].includes(tile.id)) {
+                    mapping[dropId].push(tile.id);
+                }
+                zoneIdx++;
             }
+        }
+    }
 
-            return mapping;
-        },
+    return mapping;
+},
 
         parseMatchedPairsAnswer: (text, data) => {
             const cleaned = Ed.AI.cleanAIResponse(text);
@@ -1805,17 +1992,18 @@ ${data.question}${imgSection}
         },
 
         answerGGM: async (data, mapping) => {
-            const ggm = data.widget;
-            if (!ggm) return false;
-
-            const entries = Object.entries(mapping);
-
-            for (const [dropId, tileId] of entries) {
-                const zone = ggm.querySelector(`.droppable.target[data-identifier="${dropId}"]`);
-                if (!zone) continue;
-
-                const tile = ggm.querySelector(`.draggable-item[data-identifier="${tileId}"]`);
-                if (!tile) continue;
+    const ggm = data.widget;
+    if (!ggm) return false;
+    const entries = Object.entries(mapping);
+    for (const [dropId, tileIds] of entries) {
+        // tileIds is now an array of tile IDs for this drop zone
+        const tileIdArray = Array.isArray(tileIds) ? tileIds : [tileIds];
+        for (const tileId of tileIdArray) {
+            const zone = ggm.querySelector(`.droppable.target[data-identifier="${dropId}"]`);
+            if (!zone) continue;
+            const tile = ggm.querySelector(`.draggable-item[data-identifier="${tileId}"]`);
+            if (!tile) continue;
+            if (tile.dataset.dropped === 'true') continue;
 
                 if (tile.dataset.dropped === 'true') continue;
 
@@ -1881,12 +2069,11 @@ ${data.question}${imgSection}
                     button: 0
                 });
                 zone.dispatchEvent(mouseUp);
-                await Ed.Utils.delayAsync(500);
-            }
-
-            await Ed.Utils.delayAsync(800);
-
-            // Fallback sweep
+                            await Ed.Utils.delayAsync(500);
+        }
+        } // Close inner tileIdArray loop
+        await Ed.Utils.delayAsync(800);
+        // Fallback sweep
             let remainingEmpty = Array.from(ggm.querySelectorAll('.droppable.target')).filter(z => {
                 return z.querySelector('.draggable-item, .gapmatch-item, [data-identifier]') === null;
             });
@@ -2178,7 +2365,44 @@ ${data.question}${imgSection}
     // AUTO ANSWER
     // ========================================================================
     Ed.Answer = {
-        clickSubmitOrNext: async (preferredDoc) => {
+            isOkToExit: (d) => {
+        // STRICT: Use your exact progress HTML structure
+        const progressEl = d.querySelector('.progressSummaryItem h2.progressSummaryLabel-question span.progressSummary-question, .progressSummary-question, span.progressSummary-question');
+        if (!progressEl) return false; // Not loaded yet = DO NOT EXIT
+
+        const text = progressEl.textContent.trim();
+        const match = text.match(/(\d+)\s+of\s+(\d+)/i);
+        if (!match) return false; // Can't parse = DO NOT EXIT
+
+        const current = parseInt(match[1]);
+        const total = parseInt(match[2]);
+        if (current < total) return false; // Not on last question = DO NOT EXIT
+
+        // If on last question, check if ANY submit/next button is still visible.
+        // If visible, the question isn't answered/submitted yet = DO NOT EXIT
+        const submitSelectors = '.worksheets-submit, .test-player-nav-next, button[aria-label*="Submit Answer"], button[aria-label*="Next"], .player-button.worksheets-next';
+        const submitBtn = d.querySelector(submitSelectors);
+        if (submitBtn && Ed.Utils.isVisible(submitBtn, d)) return false;
+
+        return true; // Only true if on last question AND submit button is hidden/gone
+    },
+        isEndOfTest: (d) => {
+        // Returns true if we are on the last question and it's answered, BUT NOT on the results screen yet.
+        // NOTE: #exit-session-btn is REMOVED because it exists in the header from Q1 and causes false negatives.
+        if (d.querySelector('#results-wrapper, .assessment-results, .test-results')) return false;
+        const progressEl = d.querySelector('.progressSummaryItem h2.progressSummaryLabel-question span.progressSummary-question, .progressSummary-question, span.progressSummary-question');
+        if (!progressEl) return false;
+        const text = progressEl.textContent.trim();
+        const match = text.match(/(\d+)\s+of\s+(\d+)/i);
+        if (!match) return false;
+        const current = parseInt(match[1]);
+        const total = parseInt(match[2]);
+        if (current < total) return false;
+        const submitBtn = d.querySelector('.worksheets-submit, .test-player-nav-next, button[aria-label*="Submit Answer"], button[aria-label*="Next"]');
+        if (submitBtn && Ed.Utils.isVisible(submitBtn, d)) return false;
+        return true;
+    },
+clickSubmitOrNext: async (preferredDoc) => {
             const docs = preferredDoc ? [preferredDoc] : Ed.Utils.getDocs();
             let foundBtn = null;
 
@@ -2194,7 +2418,10 @@ ${data.question}${imgSection}
                 'button[aria-label="Next Question"]',
                 'a.worksheets-next',
                 '.player-button.worksheets-next',
-                '[id^="section-"] a.worksheets-next'
+                '[id^="section-"] a.worksheets-next',
+                // Worksheets completion buttons added as final fallbacks
+                'a.player-button.worksheets-endsession',
+                'a.worksheets-endsession'
             ];
 
             for (const d of docs) {
@@ -2226,62 +2453,89 @@ ${data.question}${imgSection}
                 }
             }
 
-            if (foundBtn) {
-                foundBtn.click();
-                return true;
-            }
-            return false;
-        },
+              if (foundBtn) {
+        const doc = preferredDoc || document;
+        const isResultsScreen = !!doc.querySelector('#results-wrapper, .assessment-results, .test-results, #exit-session-btn');
+        const isLastQuestion = Ed.Answer.isEndOfTest(doc);
+        const btnText = (foundBtn.textContent || foundBtn.innerText || '').toLowerCase().trim();
+        const isFinalSubmitBtn = btnText.includes('submit test') || btnText.includes('end session') || btnText.includes('finish test') || foundBtn.matches('.worksheets-endsession, [aria-label*="Submit Test"]');
 
+        // Trigger confirmation modal if we are at the end of the test and haven't confirmed yet
+        if (!isResultsScreen && (isLastQuestion || isFinalSubmitBtn) && Ed.Config.get('CONFIRM_SUBMIT', false) && !Ed.State.hasConfirmedSubmission) {
+            Ed.Utils.setStatus('AWAITING_MANUAL');
+            const confirmed = await Ed.Nav.showConfirmModal();
+            if (!confirmed) {
+                Ed.Utils.setStatus('IDLE');
+                return false;
+            }
+            Ed.State.hasConfirmedSubmission = true;
+            Ed.Utils.setStatus('SOLVING');
+        }
+
+        foundBtn.click();
+        return true;
+    }
+    return false;
+},
         handleSaveExitDialog: async () => {
             for (const d of Ed.Utils.getDocs()) {
+                // 1. Handle confirmation dialogs FIRST (Submit Test / Save & Exit popups)
                 const dialogs = d.querySelectorAll('.ui-dialog');
                 for (const dialog of dialogs) {
                     if (!Ed.Utils.isVisible(dialog, d)) continue;
-
                     const titleEl = dialog.querySelector('.ui-dialog-title');
-                    const msgEl = dialog.querySelector('#dialog-message, .ui-dialog-content');
-
+                    const msgEl = dialog.querySelector('#dialog-message, .ui-dialog-content, #finished-dialog');
                     const titleText = titleEl ? titleEl.textContent.trim().toLowerCase() : '';
                     const msgText = msgEl ? msgEl.textContent.toLowerCase() : '';
-
-                    const isSubmit = titleText.includes('submit') || msgText.includes('submit');
-                    const isSaveExit = titleText === 'save and exit' || msgText.includes('save for later');
-
-                    if (isSubmit || isSaveExit) {
-                        const okBtn = dialog.querySelector('.ui-dialog-buttonset button.green') ||
+                    const isSubmitDialog = titleText.includes('submit test') || msgText.includes('once your test is graded');
+                    const isSaveExitDialog = titleText.includes('save and exit') || msgText.includes('save for later');
+                    if (isSubmitDialog || isSaveExitDialog) {
+                        const okBtn = dialog.querySelector('.ui-dialog-buttonset button.blue') ||
+                                      dialog.querySelector('.ui-dialog-buttonset button.green') ||
                                       dialog.querySelector('.ui-dialog-buttonset button:first-child') ||
                                       Array.from(dialog.querySelectorAll('button')).find(b => {
                                           const txt = b.textContent.trim().toUpperCase();
-                                          return txt === 'OK' || txt === 'YES' || txt === 'SUBMIT' || b.classList.contains('green') || b.classList.contains('blue');
+                                          return txt === 'OK' || txt === 'YES' || txt === 'SUBMIT';
                                       });
-
                         if (okBtn && Ed.Utils.isClickable(okBtn, d)) {
-                            if (isSubmit && Ed.Config.get('CONFIRM_SUBMIT', false) && !Ed.State.hasConfirmedSubmission) {
+                            if (isSubmitDialog && Ed.Config.get('CONFIRM_SUBMIT', false) && !Ed.State.hasConfirmedSubmission) {
                                 Ed.Utils.setStatus('AWAITING_MANUAL');
                                 const confirmed = await Ed.Nav.showConfirmModal();
-                                if (!confirmed) {
-                                    Ed.Utils.setStatus('IDLE');
-                                    return true;
-                                }
+                                if (!confirmed) { Ed.Utils.setStatus('IDLE'); return true; }
                                 Ed.State.hasConfirmedSubmission = true;
                                 Ed.Utils.setStatus('SOLVING');
                             }
-                            Ed.UI.showToast(isSaveExit ? 'Save & Exit dialog detected — clicking OK' : 'Confirming submission...', 2000);
-
-                            // Bypass jQuery UI / Angular blocking
-                                                        okBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                            Ed.UI.showToast(isSaveExitDialog ? 'Save & Exit dialog detected — clicking OK' : 'Confirming submission...', 2000);
+                            okBtn.click();
+                            okBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
                             okBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
                             okBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                            okBtn.click();
-
-                            if (isSubmit) {
-                                Ed.Answer.stopAnswer();
-                                Ed.UI.showToast('Test submitted!', 3000);
-                            }
+                            if (isSubmitDialog) { Ed.Answer.stopAnswer(); Ed.UI.showToast('Test submitted!', 3000); }
                             return true;
                         }
                     }
+                }
+
+                // 2. HARD GATE: DO NOT scan for exit buttons unless we are on the actual results screen OR the final question is answered.
+                // We explicitly IGNORE #exit-session-btn here because it exists in the header from Q1.
+                const isResultsScreen = !!d.querySelector('#results-wrapper, .assessment-results, .test-results');
+                const isFinalQuestionAnswered = Ed.Answer.isOkToExit(d);
+                if (!isResultsScreen && !isFinalQuestionAnswered) continue;
+
+                // 3. Find exit buttons, but STRICTLY EXCLUDE header/nav buttons to prevent premature clicks
+                const allExitBtns = Array.from(d.querySelectorAll('button[aria-label="Save and Exit"], button.rbi-btn.floatright, #exit-session-btn > button'));
+                for (const btn of allExitBtns) {
+                    // CRITICAL: Skip if button is inside a header, nav, or top bar
+                    if (btn.closest('header, nav, .header-wrapper, .top-nav, .global-nav, .rbi-top-nav')) continue;
+                    if (!Ed.Utils.isClickable(btn, d)) continue;
+
+                    Ed.UI.showToast('Assignment complete — closing...', 2000);
+                    btn.click();
+                    btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                    btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                    btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    await Ed.Utils.delayAsync(1000);
+                    return true;
                 }
             }
             return false;
@@ -2410,17 +2664,20 @@ ${data.question}${imgSection}
                 return;
             }
 
-            // 3. Check for Final Results Screen & Exit Buttons
+                        // 3. Check for Final Results Screen & Exit Buttons
             for (const d of Ed.Utils.getDocs()) {
                 const returnBtns = Array.from(d.querySelectorAll('button, a'));
                 for (const btn of returnBtns) {
+                    // CRITICAL: Ignore buttons inside headers/navs to prevent premature exit clicks
+                    if (btn.closest('header, nav, .header-wrapper, .top-nav, .global-nav, .rbi-top-nav')) continue;
                     const text = (btn.textContent || btn.innerText || '').toLowerCase().trim();
-
                     // Extremely strict text matching to prevent accidental clicks on the intro screen
                     const isExitBtn = text.includes('close and return') ||
-                                      text.includes('return to activities');
-
+                    text.includes('return to activities');
                     if (isExitBtn) {
+                        // STRICT: Only click if we are on the last question and it's answered, or results screen is present
+                        const isResultsScreen = !!d.querySelector('.assessment-results, .test-results');
+                        if (!isResultsScreen && !Ed.Answer.isOkToExit(d)) continue;
                         // Ensure button is actually visible/clickable on the screen
                         if (btn.offsetWidth > 0 || Ed.Utils.isVisible(btn, d)) {
                             Ed.UI.showToast('Test completed — exiting...', 3000);
@@ -3051,6 +3308,9 @@ ${data.question}${imgSection}
                     const endBtns = Array.from(d.querySelectorAll(sel));
                     for (const btn of endBtns) {
                         if (Ed.Utils.isClickable(btn, d)) {
+                            // Ensure the final question is answered before ending the session
+                            if (!Ed.Answer.isOkToExit(d)) continue;
+
                             if (Ed.Config.get('CONFIRM_SUBMIT', false) && !Ed.State.hasConfirmedSubmission) {
                                 Ed.Utils.setStatus('AWAITING_MANUAL');
                                 const confirmed = await Ed.Nav.showConfirmModal();
@@ -3073,12 +3333,11 @@ ${data.question}${imgSection}
 
         startAnswer: (silent = false) => {
             if (window.self !== window.top) return;
-            const keys = { cerebras: Ed.Config.safeGetKey('cerebras_key'), groq: Ed.Config.safeGetKey('groq_key') };
-            if (!keys.cerebras && !keys.groq) {
-                if (!silent) Ed.UI.showToast('Please set at least one API key first', 3000);
+            const keys = { cerebras: Ed.Config.safeGetKey('cerebras_key') };
+            if (!keys.cerebras) {
+                if (!silent) Ed.UI.showToast('Please set your Cerebras API key first', 3000);
                 return;
             }
-            Ed.State.activeProvider = null; // Reset provider preference when toggled
             Ed.State.answerRunning = true;
             Ed.Utils.setStatus('SOLVING');
             Ed.Config.set('AUTO_ANSWER_ENABLED', true);
@@ -3409,7 +3668,7 @@ ${data.question}${imgSection}
                 await Ed.Utils.delayAsync(300);
             }
 
-                        if (jumped && Ed.Tutorial.isTutorialDone(tocEl)) {
+            if (jumped && Ed.Tutorial.isTutorialDone(tocEl)) {
                 const p = Ed.Tutorial.getProgress();
                 const trulyDone = Ed.Tutorial.isTutorialCompletedScreen() || (p && p.cur >= p.tot);
                 if (trulyDone) {
@@ -3550,6 +3809,7 @@ ${data.question}${imgSection}
             let masteryBtn = null;
             let genericBtn = null;
             let foundLocked = false;
+            let hasUnfinished = false;
 
             for (const wrapper of wrappers) {
                 const nameEl = wrapper.querySelector('.activity-name');
@@ -3565,6 +3825,9 @@ ${data.question}${imgSection}
 
                 if (isFullyDone) continue;
                 if (isLocked) { foundLocked = true; continue; }
+
+                // If it is not done and not locked, we have active unfinished coursework
+                hasUnfinished = true;
 
                 const playBtn = wrapper.querySelector('a[lrn-button], a.hover-pop, button.activity-button');
                 if (!playBtn) continue;
@@ -3587,37 +3850,42 @@ ${data.question}${imgSection}
                 }
             }
 
-            if (tutorialBtn && autoActivity) {
-                Ed.State.isNavigating = true;
-                Ed.UI.showToast('Entering tutorial...', 2000);
-                tutorialBtn.click();
-                setTimeout(() => { Ed.State.isNavigating = false; }, 5000);
-            } else if (practiceBtn && autoActivity) {
-                Ed.State.isNavigating = true;
-                Ed.UI.showToast('Entering practice...', 2000);
-                practiceBtn.click();
-                setTimeout(() => { Ed.State.isNavigating = false; }, 5000);
-            } else if (masteryBtn && autoActivity) {
-                Ed.State.isNavigating = true;
-                Ed.UI.showToast('Entering mastery test...', 2000);
-                masteryBtn.click();
-                setTimeout(() => { Ed.State.isNavigating = false; }, 5000);
-            } else if (genericBtn && autoActivity) {
-                Ed.State.isNavigating = true;
-                Ed.UI.showToast('Entering activity...', 2000);
-                genericBtn.click();
-                setTimeout(() => { Ed.State.isNavigating = false; }, 5000);
+            // Only attempt to enter active lessons if they are unfinished
+            if (hasUnfinished) {
+                if (autoActivity) {
+                    if (tutorialBtn) {
+                        Ed.State.isNavigating = true;
+                        Ed.UI.showToast('Entering tutorial...', 2000);
+                        tutorialBtn.click();
+                        setTimeout(() => { Ed.State.isNavigating = false; }, 5000);
+                    } else if (practiceBtn) {
+                        Ed.State.isNavigating = true;
+                        Ed.UI.showToast('Entering practice...', 2000);
+                        practiceBtn.click();
+                        setTimeout(() => { Ed.State.isNavigating = false; }, 5000);
+                    } else if (masteryBtn) {
+                        Ed.State.isNavigating = true;
+                        Ed.UI.showToast('Entering mastery test...', 2000);
+                        masteryBtn.click();
+                        setTimeout(() => { Ed.State.isNavigating = false; }, 5000);
+                    } else if (genericBtn) {
+                        Ed.State.isNavigating = true;
+                        Ed.UI.showToast('Entering activity...', 2000);
+                        genericBtn.click();
+                        setTimeout(() => { Ed.State.isNavigating = false; }, 5000);
+                    }
+                }
             } else {
-                // Only check for the Next Activity arrow IF there are no activities left in the current block
+                // If there are no unfinished, unlocked lessons, it is safe to advance to the next activity
                 const nextActivityBtn = document.querySelector('lrn-launch-pad-nav a.right, a[aria-label*="Navigate to next activity"], a.right[href*="launchpad"]');
 
                 if (nextActivityBtn && Ed.Utils.isClickable(nextActivityBtn, document)) {
-                    if (Ed.Config.get('AUTO_ADVANCE_ENABLED', false)) {
+                    if (autoAdvance) {
                         Ed.State.isNavigating = true;
                         Ed.UI.showToast('Activity complete — moving to next...', 2000);
 
-                                                    nextActivityBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                            nextActivityBtn.click();
+                        nextActivityBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                        nextActivityBtn.click();
 
                         const nextUrl = nextActivityBtn.href || nextActivityBtn.getAttribute('href');
                         if (nextUrl) {
@@ -3630,7 +3898,7 @@ ${data.question}${imgSection}
                         Ed.UI.showToast('Activity complete. AutoAdvance disabled.', 3000);
                     }
                 } else if (foundLocked) {
-                    Ed.UI.showToast('Activity locked...', 2000);
+                    Ed.UI.showToast('Next activity is locked...', 2000);
                 } else {
                     Ed.UI.showToast('All activities complete', 3000);
                 }
@@ -3817,9 +4085,7 @@ ${data.question}${imgSection}
                     <div class="modal-box">
                         <div class="modal-title"><span>E</span> Edmentum Solver Setup</div>
                         <div class="modal-desc">
-                            <strong style="color:#f8fafc;">Cerebras:</strong> Go to <a href="https://www.cerebras.ai/ " target="_blank" style="color:#10b981; text-decoration:none;">cerebras.ai</a>, login until you see your API key. Pick the <strong>free subscription</strong>. Copy and input it below.<br><br>
-                            <strong style="color:#f8fafc;">Groq:</strong> Go to <a href="https://console.groq.com/keys " target="_blank" style="color:#10b981; text-decoration:none;">console.groq.com/keys</a>, click "Create API Key", name it anything, set <strong>no expiration</strong>. Copy and input it below.<br><br>
-                            <em style="color:#94a3b8;">Only 1 API provider is needed, but 2 is heavily recommended.</em>
+                        <strong style="color:#f8fafc;">Cerebras:</strong> Go to <a href="https://www.cerebras.ai/ " target="_blank" style="color:#10b981; text-decoration:none;">cerebras.ai</a>, login until you see your API key. Pick the <strong>free subscription</strong>. Copy and input it below.<br><br>
                         </div>
                         <div class="input-group">
                             <label>Cerebras API Key</label>
@@ -3827,87 +4093,50 @@ ${data.question}${imgSection}
                             <div class="key-error" id="cerebras-key-error">❌ Invalid API Key</div>
                             <div class="key-validating" id="cerebras-key-validating">⏳ Validating...</div>
                         </div>
-                        <div class="input-group">
-                            <label>Groq API Key</label>
-                            <input type="password" id="ed-groq-key" placeholder="gsk_...">
-                            <div class="key-error" id="groq-key-error">❌ Invalid API Key</div>
-                            <div class="key-validating" id="groq-key-validating">⏳ Validating...</div>
-                        </div>
                         <button class="save-btn" id="ed-save-keys">Save & Continue</button>
                     </div>`;
                 document.body.appendChild(overlay);
                 overlay.querySelector('#ed-cerebras-key').value = Ed.Config.safeGetKey("cerebras_key");
-                overlay.querySelector('#ed-groq-key').value = Ed.Config.safeGetKey("groq_key");
 
                 const btn = document.getElementById('ed-save-keys');
                 btn.focus();
 
                 btn.addEventListener('click', async () => {
                     const ck = overlay.querySelector('#ed-cerebras-key').value.trim();
-                    const gk = overlay.querySelector('#ed-groq-key').value.trim();
 
-                    if (!ck && !gk) { alert("Please provide at least one API key."); return; }
+                    if (!ck) { alert("Please provide your Cerebras API key."); return; }
 
                     btn.disabled = true;
                     btn.textContent = "Validating...";
 
                     let cerebrasValid = true;
-                    let groqValid = true;
 
-                    if (ck) {
-                        const cerebrasError = overlay.querySelector('#cerebras-key-error');
-                        const cerebrasValidating = overlay.querySelector('#cerebras-key-validating');
-                        cerebrasError.classList.remove('show');
-                        cerebrasValidating.classList.add('show');
+                    const cerebrasError = overlay.querySelector('#cerebras-key-error');
+                    const cerebrasValidating = overlay.querySelector('#cerebras-key-validating');
+                    cerebrasError.classList.remove('show');
+                    cerebrasValidating.classList.add('show');
 
-                        const result = await Ed.AI.validateKey('cerebras', ck);
-                        cerebrasValidating.classList.remove('show');
+                    const result = await Ed.AI.validateKey('cerebras', ck);
+                    cerebrasValidating.classList.remove('show');
 
-                        if (result.valid === false) {
-                            cerebrasValid = false;
-                            cerebrasError.textContent = `❌ ${result.error}`;
-                            cerebrasError.classList.add('show');
-                        } else if (result.valid === null) {
-                            cerebrasError.textContent = `⚠️ Could not verify (network error). Key will be saved anyway.`;
-                            cerebrasError.style.color = '#f59e0b';
-                            cerebrasError.classList.add('show');
-                        }
+                    if (result.valid === false) {
+                        cerebrasValid = false;
+                        cerebrasError.textContent = `❌ ${result.error}`;
+                        cerebrasError.classList.add('show');
+                    } else if (result.valid === null) {
+                        cerebrasError.textContent = `⚠️ Could not verify (network error). Key will be saved anyway.`;
+                        cerebrasError.style.color = '#f59e0b';
+                        cerebrasError.classList.add('show');
                     }
 
-                    if (gk) {
-                        const groqError = overlay.querySelector('#groq-key-error');
-                        const groqValidating = overlay.querySelector('#groq-key-validating');
-                        groqError.classList.remove('show');
-                        groqValidating.classList.add('show');
-
-                        const result = await Ed.AI.validateKey('groq', gk);
-                        groqValidating.classList.remove('show');
-
-                        if (result.valid === false) {
-                            groqValid = false;
-                            groqError.textContent = `❌ ${result.error}`;
-                            groqError.classList.add('show');
-                        } else if (result.valid === null) {
-                            groqError.textContent = `⚠️ Could not verify (network error). Key will be saved anyway.`;
-                            groqError.style.color = '#f59e0b';
-                            groqError.classList.add('show');
-                        }
-                    }
-
-                    if (!cerebrasValid || !groqValid) {
+                    if (!cerebrasValid) {
                         btn.disabled = false;
                         btn.textContent = "Save & Continue";
-
-                        if (!cerebrasValid && ck) {
-                            Ed.Notifications.showInvalidKeyModal("Cerebras", overlay.querySelector('#cerebras-key-error').textContent.replace('❌ ', ''));
-                        } else if (!groqValid && gk) {
-                            Ed.Notifications.showInvalidKeyModal("Groq", overlay.querySelector('#groq-key-error').textContent.replace('❌ ', ''));
-                        }
+                        Ed.Notifications.showInvalidKeyModal("Cerebras", overlay.querySelector('#cerebras-key-error').textContent.replace('❌ ', ''));
                         return;
                     }
 
-                    if (ck) Ed.Config.set("cerebras_key", Ed.Config.encode(ck));
-                    if (gk) Ed.Config.set("groq_key", Ed.Config.encode(gk));
+                    Ed.Config.set("cerebras_key", Ed.Config.encode(ck));
                     Ed.UI.closeModalSmoothly(overlay, resolve);
                 });
             });
@@ -3984,7 +4213,8 @@ ${data.question}${imgSection}
                             <strong>Auto Answer:</strong> ON (25-35s delay)<br>
                             <strong>Background Mode:</strong> ON<br>
                             <strong>Auto Notify:</strong> ON<br>
-                            <strong>Auto Advance:</strong> ON
+                            <strong>Auto Advance:</strong> ON<br>
+                            <strong>Cerebras Reasoning:</strong> ON
                         </div>
                         <div class="btn-row">
                             <button class="save-btn btn-secondary" id="btn-no-recom">No, skip</button>
@@ -4019,7 +4249,8 @@ ${data.question}${imgSection}
                         "BACKGROUND_MODE": true,
                         "AUTO_NOTIFY": true,
                         "TOAST_ENABLED": true,
-                        "CONFIRM_SUBMIT": false
+                        "CONFIRM_SUBMIT": false,
+                        "CEREBRAS_REASONING": true
                     };
 
                     await Ed.UI.animateSettingsApplication(settings);
@@ -4077,438 +4308,413 @@ ${data.question}${imgSection}
             }
 
             const shadow = host.attachShadow({ mode: 'open' });
-            const style = document.createElement('style');
-            style.textContent = `
-                :host { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        const style = document.createElement('style');
+        style.textContent = `
+            :host { all: initial; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
 
-                .icon { width: 14px; height: 14px; fill: currentColor; display: inline-block; vertical-align: middle; }
-                .icon-lg { width: 18px; height: 18px; }
+            .icon { width: 14px; height: 14px; fill: currentColor; display: inline-block; vertical-align: middle; }
+            .icon-lg { width: 18px; height: 18px; }
 
-                #panel { width: 380px; background: rgba(15, 23, 42, 0.98); border-radius: 24px; box-shadow: 0 20px 60px rgba(0,0,0,0.8); overflow: hidden; border: 1px solid rgba(255,255,255,0.08); backdrop-filter: blur(20px); user-select: none; transition: box-shadow 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
-                #panel.solving { box-shadow: 0 0 35px rgba(16, 185, 129, 0.4); border-color: rgba(16, 185, 129, 0.4); }
-                .header { padding: 18px 24px; display: flex; align-items: center; gap: 12px; cursor: move; background: rgba(30, 41, 59, 0.9); border-bottom: 1px solid rgba(255,255,255,0.05); }
-                .logo { background: linear-gradient(135deg, #10b981, #3b82f6); width: 28px; height: 28px; display: flex; justify-content: center; align-items: center; border-radius: 8px; font-size: 16px; color: white; font-weight: 600; text-align: center; line-height: 28px; box-shadow: 0 4px 10px rgba(16, 185, 129, 0.3); }
-                .title { color: #f8fafc; font-weight: 700; font-size: 15px; letter-spacing: -0.3px; flex: 1; }
-                .header-btns { display: flex; gap: 10px; }
-                .header-btn { background: none; border: none; color: #64748b; font-size: 18px; cursor: pointer; transition: color 0.2s; line-height: 1; padding: 0; }
-                .header-btn:hover { color: #f8fafc; }
-                .tabs { display: flex; background: rgba(30, 41, 59, 0.6); border-bottom: 1px solid rgba(255,255,255,0.05); }
-                .tab { flex: 1; text-align: center; padding: 14px 0; color: #64748b; font-size: 12px; font-weight: 700; cursor: pointer; transition: color 0.2s, border-color 0.2s; border-bottom: 2px solid transparent; text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; justify-content: center; gap: 6px; }
-                .tab:hover { color: #94a3b8; }
-                .tab.active { color: #f8fafc; border-bottom: 2px solid #10b981; }
-                .tab svg { width: 14px; height: 14px; }
-                .tab-content { display: none; } .tab-content.active { display: block; }
-                .content { padding: 16px 20px 20px; overflow-y: auto; max-height: 600px; }
-                .content::-webkit-scrollbar { width: 6px; } .content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
-                .row { background: rgba(30, 41, 59, 0.6); margin-bottom: 12px; padding: 14px 16px; border-radius: 14px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: background 0.2s, transform 0.1s; border: 1px solid transparent; }
-                .row:hover { background: rgba(51, 65, 85, 0.6); border-color: rgba(255,255,255,0.05); }
-                .row:active { transform: scale(0.98); }
-                .row-label { display: flex; flex-direction: column; gap: 5px; flex: 1; pointer-events: none; }
-                .row-title { color: #f1f5f9; font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
-                .row-desc { color: #94a3b8; font-size: 12px; font-weight: 400; padding-right: 12px; line-height: 1.4; }
-                .row-controls { display: flex; align-items: center; gap: 12px; }
-                .delay-input { width: 60px; padding: 6px; background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(255,255,255,0.1); color: #f8fafc; border-radius: 8px; text-align: center; font-size: 12px; outline: none; font-family: inherit; transition: border 0.2s; }
-                .delay-input:focus { border-color: #10b981; }
-                .delay-unit { color: #64748b; font-size: 11px; pointer-events: none; text-transform: uppercase; font-weight: 600; }
-                .toggle { width: 44px; height: 24px; background: #334155; border-radius: 24px; position: relative; cursor: pointer; transition: background 0.3s, border-color 0.3s; pointer-events: none; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.05); }
-                .toggle::after { content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; background: white; border-radius: 50%; transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow 0.2s; }
-                .toggle.active { background: #10b981; border-color: #10b981; }
-                .toggle.active::after { transform: translateX(20px); box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
-                .about-content { padding: 24px; color: #94a3b8; font-size: 13px; line-height: 1.7; }
-                .about-title { color: #f8fafc; font-size: 18px; font-weight: 700; margin-bottom: 15px; background: linear-gradient(135deg, #10b981, #3b82f6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-                .section-divider { height: 1px; background: rgba(255,255,255,0.05); margin: 16px 0; }
-                .section-label { color: #64748b; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 12px; padding-left: 2px; display: flex; align-items: center; gap: 8px; }
-                .section-label::after { content: ''; height: 1px; flex: 1; background: rgba(255,255,255,0.05); }
-                .hidden { display: none !important; }
+            #panel { width: 380px; background: rgba(15, 23, 42, 0.98); border-radius: 24px; box-shadow: 0 20px 60px rgba(0,0,0,0.8); overflow: hidden; border: 1px solid rgba(255,255,255,0.08); backdrop-filter: blur(20px); user-select: none; transition: box-shadow 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
+            #panel.solving { box-shadow: 0 0 35px rgba(16, 185, 129, 0.4); border-color: rgba(16, 185, 129, 0.4); }
+            .header { padding: 18px 24px; display: flex; align-items: center; gap: 12px; cursor: move; background: rgba(30, 41, 59, 0.9); border-bottom: 1px solid rgba(255,255,255,0.05); }
+            .logo { background: linear-gradient(135deg, #10b981, #3b82f6); width: 28px; height: 28px; display: flex; justify-content: center; align-items: center; border-radius: 8px; font-size: 16px; color: white; font-weight: 600; text-align: center; line-height: 28px; box-shadow: 0 4px 10px rgba(16, 185, 129, 0.3); }
+            .title { color: #f8fafc; font-weight: 700; font-size: 15px; letter-spacing: -0.3px; flex: 1; }
+            .header-btns { display: flex; gap: 10px; }
+            .header-btn { background: none; border: none; color: #64748b; font-size: 18px; cursor: pointer; transition: color 0.2s; line-height: 1; padding: 0; }
+            .header-btn:hover { color: #f8fafc; }
+            .tabs { display: flex; background: rgba(30, 41, 59, 0.6); border-bottom: 1px solid rgba(255,255,255,0.05); }
+            .tab { flex: 1; text-align: center; padding: 14px 0; color: #64748b; font-size: 12px; font-weight: 700; cursor: pointer; transition: color 0.2s, border-color 0.2s; border-bottom: 2px solid transparent; text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; justify-content: center; gap: 6px; }
+            .tab:hover { color: #94a3b8; }
+            .tab.active { color: #f8fafc; border-bottom: 2px solid #10b981; }
+            .tab svg { width: 14px; height: 14px; }
+            .tab-content { display: none; } .tab-content.active { display: block; }
+            .content { padding: 16px 20px 20px; overflow-y: auto; max-height: 600px; }
+            .content::-webkit-scrollbar { width: 6px; } .content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+            .row { background: rgba(30, 41, 59, 0.6); margin-bottom: 12px; padding: 14px 16px; border-radius: 14px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: background 0.2s, transform 0.1s; border: 1px solid transparent; }
+            .row:hover { background: rgba(51, 65, 85, 0.6); border-color: rgba(255,255,255,0.05); }
+            .row:active { transform: scale(0.98); }
+            .row-label { display: flex; flex-direction: column; gap: 5px; flex: 1; pointer-events: none; }
+            .row-title { color: #f1f5f9; font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+            .row-desc { color: #94a3b8; font-size: 12px; font-weight: 400; padding-right: 12px; line-height: 1.4; }
+            .row-controls { display: flex; align-items: center; gap: 12px; }
+            .delay-input { width: 60px; padding: 6px; background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(255,255,255,0.1); color: #f8fafc; border-radius: 8px; text-align: center; font-size: 12px; outline: none; font-family: inherit; transition: border 0.2s; }
+            .delay-input:focus { border-color: #10b981; }
+            .delay-unit { color: #64748b; font-size: 11px; pointer-events: none; text-transform: uppercase; font-weight: 600; }
+            .toggle { width: 44px; height: 24px; background: #334155; border-radius: 24px; position: relative; cursor: pointer; transition: background 0.3s, border-color 0.3s; pointer-events: none; flex-shrink: 0; border: 1px solid rgba(255,255,255,0.05); }
+            .toggle::after { content: ''; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; background: white; border-radius: 50%; transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow 0.2s; }
+            .toggle.active { background: #10b981; border-color: #10b981; }
+            .toggle.active::after { transform: translateX(20px); box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
+            .about-content { padding: 24px; color: #94a3b8; font-size: 13px; line-height: 1.7; }
+            .about-title { color: #f8fafc; font-size: 18px; font-weight: 700; margin-bottom: 15px; background: linear-gradient(135deg, #10b981, #3b82f6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+            .section-divider { height: 1px; background: rgba(255,255,255,0.05); margin: 16px 0; }
+            .section-label { color: #64748b; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 12px; padding-left: 2px; display: flex; align-items: center; gap: 8px; }
+            .section-label::after { content: ''; height: 1px; flex: 1; background: rgba(255,255,255,0.05); }
+            .hidden { display: none !important; }
 
-                .resume-btn { width: 100%; margin-top: 12px; padding: 14px; background: linear-gradient(135deg, #10b981, #059669); color: white; border: none; border-radius: 12px; font-weight: 700; font-size: 14px; cursor: pointer; text-align: center; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3); transition: transform 0.2s; }
-                .resume-btn:hover { transform: translateY(-1px); filter: brightness(1.1); }
+            .resume-btn { width: 100%; margin-top: 12px; padding: 14px; background: linear-gradient(135deg, #10b981, #059669); color: white; border: none; border-radius: 12px; font-weight: 700; font-size: 14px; cursor: pointer; text-align: center; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3); transition: transform 0.2s; }
+            .resume-btn:hover { transform: translateY(-1px); filter: brightness(1.1); }
 
-                .api-card { background: rgba(30, 41, 59, 0.5); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 15px; margin-bottom: 15px; transition: border-color 0.2s, background 0.2s; }
-                .api-card:hover { border-color: rgba(16, 185, 129, 0.4); background: rgba(30, 41, 59, 0.8); }
-                .api-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-                .api-card-title { color: #f1f5f9; font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
-                .api-link { color: #10b981; text-decoration: none; font-size: 11px; font-weight: 600; padding: 4px 8px; background: rgba(16, 185, 129, 0.1); border-radius: 6px; transition: background 0.2s; }
-                .api-link:hover { background: rgba(16, 185, 129, 0.2); }
-                .api-input-wrapper { display: flex; gap: 8px; align-items: center; background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(255,255,255,0.1); padding: 4px; border-radius: 8px; transition: border-color 0.2s; }
-                .api-input-wrapper:focus-within { border-color: #10b981; box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2); }
-                .api-key-input { flex: 1; background: transparent; border: none; color: #f8fafc; font-size: 13px; font-family: monospace; padding: 8px 6px; outline: none; }
-                .api-action-btn { background: transparent; border: none; color: #64748b; cursor: pointer; padding: 6px; border-radius: 6px; display: flex; align-items: center; justify-content: center; transition: background 0.2s, color 0.2s; }
-                .api-action-btn:hover { background: rgba(255,255,255,0.1); color: #f8fafc; }
-                .api-status { font-size: 11px; margin-top: 8px; font-weight: 500; display: none; }
-                .api-status.success { color: #10b981; display: block; }
-                .api-status.error { color: #ef4444; display: block; }
-                .api-status.validating { color: #3b82f6; display: block; }
+            .api-card { background: rgba(30, 41, 59, 0.5); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 15px; margin-bottom: 15px; transition: border-color 0.2s, background 0.2s; }
+            .api-card:hover { border-color: rgba(16, 185, 129, 0.4); background: rgba(30, 41, 59, 0.8); }
+            .api-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+            .api-card-title { color: #f1f5f9; font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+            .api-link { color: #10b981; text-decoration: none; font-size: 11px; font-weight: 600; padding: 4px 8px; background: rgba(16, 185, 129, 0.1); border-radius: 6px; transition: background 0.2s; }
+            .api-link:hover { background: rgba(16, 185, 129, 0.2); }
+            .api-input-wrapper { display: flex; gap: 8px; align-items: center; background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(255,255,255,0.1); padding: 4px; border-radius: 8px; transition: border-color 0.2s; }
+            .api-input-wrapper:focus-within { border-color: #10b981; box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2); }
+            .api-key-input { flex: 1; background: transparent; border: none; color: #f8fafc; font-size: 13px; font-family: monospace; padding: 8px 6px; outline: none; }
+            .api-action-btn { background: transparent; border: none; color: #64748b; cursor: pointer; padding: 6px; border-radius: 6px; display: flex; align-items: center; justify-content: center; transition: background 0.2s, color 0.2s; }
+            .api-action-btn:hover { background: rgba(255,255,255,0.1); color: #f8fafc; }
+            .api-status { font-size: 11px; margin-top: 8px; font-weight: 500; display: none; }
+            .api-status.success { color: #10b981; display: block; }
+            .api-status.error { color: #ef4444; display: block; }
+            .api-status.validating { color: #3b82f6; display: block; }
 
-                .faq-q { color: #f8fafc; font-weight: 600; margin-top: 15px; margin-bottom: 5px; }
-                .faq-a { color: #94a3b8; font-size: 12px; margin-bottom: 10px; }
-            `;
-            shadow.appendChild(style);
-            const p = document.createElement('div'); p.id = 'panel';
-            Ed.UI.panelElement = p;
+            .faq-q { color: #f8fafc; font-weight: 600; margin-top: 15px; margin-bottom: 5px; }
+            .faq-a { color: #94a3b8; font-size: 12px; margin-bottom: 10px; }
+        `;
+        shadow.appendChild(style);
+        const p = document.createElement('div'); p.id = 'panel';
+        Ed.UI.panelElement = p;
 
-            const tutVal = Ed.Config.get("TUTORIAL_DELAY") || "30";
-            const testVal = Ed.Config.get("ANSWER_DELAY") || "25-35";
+        const tutVal = Ed.Config.get("TUTORIAL_DELAY") || "30";
+        const testVal = Ed.Config.get("ANSWER_DELAY") || "25-35";
 
-            const tutActive = Ed.Config.get("AUTO_TUTORIAL_ENABLED", false) ? 'active' : '';
-            const testActive = Ed.Config.get("AUTO_ANSWER_ENABLED", false) ? 'active' : '';
-            const actActive = Ed.Config.get("AUTO_ACTIVITY_ENABLED", false) ? 'active' : '';
-            const autoAdvActive = Ed.Config.get("AUTO_ADVANCE_ENABLED", false) ? 'active' : '';
-            const confirmSubmitActive = Ed.Config.get("CONFIRM_SUBMIT", false) ? 'active' : '';
-            const autoNotifActive = Ed.Config.get("AUTO_NOTIFY", true) ? 'active' : '';
-            const toastActive = Ed.Config.get("TOAST_ENABLED", true) ? 'active' : '';
-            const bgModeActive = Ed.Config.get("BACKGROUND_MODE", false) ? 'active' : '';
-            const autoHideActive = Ed.Config.get("AUTOHIDE_ENABLED", false) ? 'active' : '';
+        const tutActive = Ed.Config.get("AUTO_TUTORIAL_ENABLED", false) ? 'active' : '';
+        const testActive = Ed.Config.get("AUTO_ANSWER_ENABLED", false) ? 'active' : '';
+        const actActive = Ed.Config.get("AUTO_ACTIVITY_ENABLED", false) ? 'active' : '';
+        const autoAdvActive = Ed.Config.get("AUTO_ADVANCE_ENABLED", false) ? 'active' : '';
+        const confirmSubmitActive = Ed.Config.get("CONFIRM_SUBMIT", false) ? 'active' : '';
+        const autoNotifActive = Ed.Config.get("AUTO_NOTIFY", true) ? 'active' : '';
+        const toastActive = Ed.Config.get("TOAST_ENABLED", true) ? 'active' : '';
+        const bgModeActive = Ed.Config.get("BACKGROUND_MODE", false) ? 'active' : '';
+        const autoHideActive = Ed.Config.get("AUTOHIDE_ENABLED", false) ? 'active' : '';
+        const reasoningActive = Ed.Config.get("CEREBRAS_REASONING", true) ? 'active' : '';
 
-            p.innerHTML = `
-                <div class="header"><div class="logo">E</div><div class="title">Edmentum Solver <span id="version-tag" style="font-size: 10px; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; margin-left: 8px; font-weight: 500;">v1.0.1</span></div><div class="header-btns"><button class="header-btn" id="collapse-btn">—</button><button class="header-btn" id="hide-btn">✕</button></div></div>
-                <div id="panel-body">
-                   <div class="tabs">
-                        <div class="tab active" data-tab="features"><svg viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Features</div>
-                        <div class="tab" data-tab="api"><svg viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg> API</div>
-                        <div class="tab" data-tab="about"><svg viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> About</div>
-                   </div>
-                    <div class="tab-content active" id="tab-features">
-                        <div class="content">
-                            <div class="section-label">Core Automation</div>
-                            <div class="row" data-key="AUTO_TUTORIAL_ENABLED">
-                                <div class="row-label"><div class="row-title">Auto Tutorial</div><div class="row-desc">Navigates through tutorial slides</div></div>
-                                <div class="row-controls"><input type="text" class="delay-input" data-delay="TUTORIAL_DELAY" value="${tutVal}"><span class="delay-unit">s</span><div class="toggle ${tutActive}"></div></div>
-                            </div>
-                            <div class="row" data-key="AUTO_ANSWER_ENABLED">
-                                <div class="row-label"><div class="row-title">Auto Answer</div><div class="row-desc">Answers test questions with AI</div></div>
-                                <div class="row-controls"><input type="text" class="delay-input" data-delay="ANSWER_DELAY" value="${testVal}"><span class="delay-unit">s</span><div class="toggle ${testActive}"></div></div>
-                            </div>
-                            <div class="row" data-key="AUTO_ACTIVITY_ENABLED">
-                                <div class="row-label"><div class="row-title">Auto Enter Activity</div><div class="row-desc">Automatically enters the next module</div></div>
-                                <div class="row-controls"><div class="toggle ${actActive}"></div></div>
-                            </div>
-                            <div class="row" data-key="AUTO_ADVANCE_ENABLED">
-                                <div class="row-label"><div class="row-title">Auto Advance</div><div class="row-desc">Automatically moves to the next activity when complete</div></div>
-                                <div class="row-controls"><div class="toggle ${autoAdvActive}"></div></div>
-                            </div>
-                            <div class="row" data-key="CONFIRM_SUBMIT">
-                                <div class="row-label"><div class="row-title">Confirm Before Submit</div><div class="row-desc">Halts script at the end to let you review answers</div></div>
-                                <div class="row-controls"><div class="toggle ${confirmSubmitActive}"></div></div>
-                            </div>
-                            <button class="resume-btn" id="ed-resume-btn" style="display:none;">▶ Resume & Submit</button>
-
-                            <div class="section-divider"></div>
-                            <div class="section-label">Background</div>
-                            <div class="row" data-key="BACKGROUND_MODE">
-                                <div class="row-label"><div class="row-title">Background Mode</div><div class="row-desc">Prevents throttling when tab is out of focus</div></div>
-                                <div class="row-controls"><div class="toggle ${bgModeActive}"></div></div>
-                            </div>
-
-                            <div class="section-divider"></div>
-                            <div class="section-label">Notifications</div>
-                            <div class="row" data-key="AUTO_NOTIFY">
-                                <div class="row-label"><div class="row-title">Desktop Notifications</div><div class="row-desc">Alerts you on completion or stuck failures</div></div>
-                                <div class="row-controls"><div class="toggle ${autoNotifActive}"></div></div>
-                            </div>
-                            <div class="row" data-key="TOAST_ENABLED">
-                                <div class="row-label"><div class="row-title">UI Toasts</div><div class="row-desc">Shows status popups at bottom of screen</div></div>
-                                <div class="row-controls"><div class="toggle ${toastActive}"></div></div>
-                            </div>
-
-                            <div class="section-divider"></div>
-                            <div class="section-label">Privacy</div>
-                            <div class="row" data-key="AUTOHIDE_ENABLED">
-                                <div class="row-label"><div class="row-title">Auto Hide Personal Info</div><div class="row-desc">Hides name, avatar, and date from the header</div></div>
-                                <div class="row-controls"><div class="toggle ${autoHideActive}"></div></div>
-                            </div>
+        p.innerHTML = `
+            <div class="header"><div class="logo">E</div><div class="title">Edmentum Solver <span id="version-tag" style="font-size: 10px; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; margin-left: 8px; font-weight: 500;">v1.1.0</span></div><div class="header-btns"><button class="header-btn" id="collapse-btn">—</button><button class="header-btn" id="hide-btn">✕</button></div></div>
+            <div id="panel-body">
+               <div class="tabs">
+                    <div class="tab active" data-tab="features"><svg viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Features</div>
+                    <div class="tab" data-tab="api"><svg viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg> API</div>
+                    <div class="tab" data-tab="about"><svg viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> About</div>
+               </div>
+                <div class="tab-content active" id="tab-features">
+                    <div class="content">
+                        <div class="section-label">Core Automation</div>
+                        <div class="row" data-key="AUTO_TUTORIAL_ENABLED">
+                            <div class="row-label"><div class="row-title">Auto Tutorial</div><div class="row-desc">Navigates through tutorial slides</div></div>
+                            <div class="row-controls"><input type="text" class="delay-input" data-delay="TUTORIAL_DELAY" value="${tutVal}"><span class="delay-unit">s</span><div class="toggle ${tutActive}"></div></div>
                         </div>
-                    </div>
-                    <div class="tab-content" id="tab-api">
-                        <div class="content">
-                            <div class="section-label">API Keys (Manage Only)</div>
-                            <div style="font-size: 12px; color: #94a3b8; margin-bottom: 15px; line-height: 1.5; padding: 10px; background: rgba(16, 185, 129, 0.1); border-radius: 10px; border: 1px solid rgba(16, 185, 129, 0.2);">
-                                Connect at least one AI provider. Using both is recommended to avoid rate limits.
-                            </div>
-
-                            <div class="api-card" data-provider="cerebras">
-                                <div class="api-card-header">
-                                    <div class="api-card-title"><span style="color:#f97316; font-weight: bold;">C</span> Cerebras</div>
-                                    <a href="https://cloud.cerebras.ai" target="_blank" class="api-link">Get Key ↗</a>
-                                </div>
-                                <div class="api-input-wrapper">
-                                    <input type="password" class="api-key-input" id="api-cerebras-input" placeholder="sk-...">
-                                    <button class="api-action-btn api-toggle-vis" title="Show/Hide">
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-                                    </button>
-                                    <button class="api-action-btn api-delete-key" title="Delete">
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-                                    </button>
-                                </div>
-                                <div class="api-status" id="api-cerebras-status"></div>
-                            </div>
-
-                            <div class="api-card" data-provider="groq">
-                                <div class="api-card-header">
-                                    <div class="api-card-title"><span style="color:#ef4444; font-weight: bold;">G</span> Groq</div>
-                                    <a href="https://console.groq.com/keys" target="_blank" class="api-link">Get Key ↗</a>
-                                </div>
-                                <div class="api-input-wrapper">
-                                    <input type="password" class="api-key-input" id="api-groq-input" placeholder="gsk_...">
-                                    <button class="api-action-btn api-toggle-vis" title="Show/Hide">
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-                                    </button>
-                                    <button class="api-action-btn api-delete-key" title="Delete">
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-                                    </button>
-                                </div>
-                                <div class="api-status" id="api-groq-status"></div>
-                            </div>
-
-                            <div class="section-divider"></div>
-                            <div class="section-label">AI Settings</div>
-                            <div class="row" style="cursor: default; background: transparent;">
-                                <div class="row-label"><div class="row-title">Reasoning Effort</div><div class="row-desc">Adjust the intelligence level. High reasoning improves accuracy but uses more tokens and may cause truncation errors.</div></div>
-                                <div class="row-controls">
-                                    <select id="api-reasoning-select" style="background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(255,255,255,0.1); color: #f8fafc; border-radius: 8px; padding: 6px; outline: none; font-size: 12px;">
-                                        <option value="low">Low</option>
-                                        <option value="medium">Medium</option>
-                                        <option value="high">High</option>
-                                    </select>
-                                </div>
-                            </div>
+                        <div class="row" data-key="AUTO_ANSWER_ENABLED">
+                            <div class="row-label"><div class="row-title">Auto Answer</div><div class="row-desc">Answers test questions with AI</div></div>
+                            <div class="row-controls"><input type="text" class="delay-input" data-delay="ANSWER_DELAY" value="${testVal}"><span class="delay-unit">s</span><div class="toggle ${testActive}"></div></div>
                         </div>
-                    </div>
-                    <div class="tab-content" id="tab-about"><div class="about-content">
-                        <div class="about-title">Edmentum Solver v1.0.0</div>
-                        <div style="margin-bottom: 10px;">Made by floor with AI.<br>Press <strong>Alt + H</strong> to hide UI (Shift+Alt+H for permanent hide).</div>
+                        <div class="row" data-key="AUTO_ACTIVITY_ENABLED">
+                            <div class="row-label"><div class="row-title">Auto Enter Activity</div><div class="row-desc">Automatically enters the next module</div></div>
+                            <div class="row-controls"><div class="toggle ${actActive}"></div></div>
+                        </div>
+                        <div class="row" data-key="AUTO_ADVANCE_ENABLED">
+                            <div class="row-label"><div class="row-title">Auto Advance</div><div class="row-desc">Automatically moves to the next activity when complete</div></div>
+                            <div class="row-controls"><div class="toggle ${autoAdvActive}"></div></div>
+                        </div>
+                        <div class="row" data-key="CONFIRM_SUBMIT">
+                            <div class="row-label"><div class="row-title">Confirm Before Submit</div><div class="row-desc">Halts script at the end to let you review answers</div></div>
+                            <div class="row-controls"><div class="toggle ${confirmSubmitActive}"></div></div>
+                        </div>
+                        <button class="resume-btn" id="ed-resume-btn" style="display:none;">▶ Resume & Submit</button>
 
                         <div class="section-divider"></div>
-                        <div class="about-title" style="font-size:14px; margin-bottom:8px;">FAQ</div>
-                        <div class="faq-q">What does this script automate?</div>
-                        <div class="faq-a">The script can automate basically everything in my testing, however there may be a few activities I havent been able to get and therefore aren't supported.</div>
+                        <div class="section-label">Background</div>
+                        <div class="row" data-key="BACKGROUND_MODE">
+                            <div class="row-label"><div class="row-title">Background Mode</div><div class="row-desc">Prevents throttling when tab is out of focus</div></div>
+                            <div class="row-controls"><div class="toggle ${bgModeActive}"></div></div>
+                        </div>
 
-                        <div class="faq-q">Is the AI 100% perfect?</div>
-                        <div class="faq-a">No, the AI is not 100% perfect. It will help a ton, but always double-check important assignments. In my testing it is usually 80-100% accuracte.</div>
+                        <div class="section-divider"></div>
+                        <div class="section-label">Notifications</div>
+                        <div class="row" data-key="AUTO_NOTIFY">
+                            <div class="row-label"><div class="row-title">Desktop Notifications</div><div class="row-desc">Alerts you on completion or stuck failures</div></div>
+                            <div class="row-controls"><div class="toggle ${autoNotifActive}"></div></div>
+                        </div>
+                        <div class="row" data-key="TOAST_ENABLED">
+                            <div class="row-label"><div class="row-title">UI Toasts</div><div class="row-desc">Shows status popups at bottom of screen</div></div>
+                            <div class="row-controls"><div class="toggle ${toastActive}"></div></div>
+                        </div>
 
-                        <div class="faq-q">How do range delays work?</div>
-                        <div class="faq-a">Enter e.g. <code>25-35</code> to have the script pick a random wait time between 25s and 35s.</div>
-
-                        <div class="faq-q">Why does the script randomly pause?</div>
-                        <div class="faq-a">If Confirm Before Submit is ON, it stops so you can review. Also, if rate limited, the AI will back off and retry automatically. Otherwise please contact me with a video of it stuck.</div>
-
-                        <div class="faq-q">How do I get Desktop Notifications?</div>
-                        <div class="faq-a">Enable Auto Notify and allow notifications in your browser permissions near the URL bar.</div>
-                    </div></div>
+                        <div class="section-divider"></div>
+                        <div class="section-label">Privacy</div>
+                        <div class="row" data-key="AUTOHIDE_ENABLED">
+                            <div class="row-label"><div class="row-title">Auto Hide Personal Info</div><div class="row-desc">Hides name, avatar, and date from the header</div></div>
+                            <div class="row-controls"><div class="toggle ${autoHideActive}"></div></div>
+                        </div>
+                    </div>
                 </div>
-            `;
-            shadow.appendChild(p);
+                <div class="tab-content" id="tab-api">
+                    <div class="content">
+                        <div class="section-label">API Keys (Manage Only)</div>
+                        <div style="font-size: 12px; color: #94a3b8; margin-bottom: 15px; line-height: 1.5; padding: 10px; background: rgba(16, 185, 129, 0.1); border-radius: 10px; border: 1px solid rgba(16, 185, 129, 0.2);">
+                            Connect your Cerebras API provider to solve questions using Z.ai GLM 4.7.
+                        </div>
 
-            const panelBody = shadow.getElementById('panel-body');
-            if (Ed.Config.get("UI_COLLAPSED", false)) panelBody.classList.add('hidden');
+                        <div class="api-card" data-provider="cerebras">
+                            <div class="api-card-header">
+                                <div class="api-card-title"><span style="color:#f97316; font-weight: bold;">C</span> Cerebras</div>
+                                <a href="https://cloud.cerebras.ai" target="_blank" class="api-link">Get Key ↗</a>
+                            </div>
+                            <div class="api-input-wrapper">
+                                <input type="password" class="api-key-input" id="api-cerebras-input" placeholder="sk-...">
+                                <button class="api-action-btn api-toggle-vis" title="Show/Hide">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                                </button>
+                                <button class="api-action-btn api-delete-key" title="Delete">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                                </button>
+                            </div>
+                            <div class="api-status" id="api-cerebras-status"></div>
+                        </div>
 
-            const cerebrasInput = shadow.getElementById('api-cerebras-input');
-            const groqInput = shadow.getElementById('api-groq-input');
-            if (cerebrasInput) cerebrasInput.value = Ed.Config.safeGetKey("cerebras_key");
-            if (groqInput) groqInput.value = Ed.Config.safeGetKey("groq_key");
+                        <div class="section-divider"></div>
+                        <div class="section-label">AI Settings</div>
+                        <div class="row" data-key="CEREBRAS_REASONING">
+                            <div class="row-label">
+                                <div class="row-title">Enable Reasoning</div>
+                                <div class="row-desc">Generates deep step-by-step thinking for maximum accuracy. Disabling reasoning will produce immediate, shorter answers.</div>
+                            </div>
+                            <div class="row-controls">
+                                <div class="toggle ${reasoningActive}"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="tab-content" id="tab-about"><div class="about-content">
+                    <div class="about-title">Edmentum Solver v1.1.0</div>
+                    <div style="margin-bottom: 10px;">Made by floor with AI.<br>Press <strong>Alt + H</strong> to hide UI (Shift+Alt+H for permanent hide).</div>
 
-            const reasoningSelect = shadow.getElementById('api-reasoning-select');
-            if (reasoningSelect) {
-                reasoningSelect.value = Ed.Config.get('REASONING_LEVEL', 'medium');
-                reasoningSelect.addEventListener('change', (e) => {
-                    Ed.Config.set('REASONING_LEVEL', e.target.value);
-                    Ed.UI.showToast(`Reasoning effort set to ${e.target.value}`, 2000);
-                });
-            }
+                    <div class="section-divider"></div>
+                    <div class="about-title" style="font-size:14px; margin-bottom:8px;">FAQ</div>
+                    <div class="faq-q">What does this script automate?</div>
+                    <div class="faq-a">The script can automate tests and tutorials, and be able to autoenter them and go to next lesson, it cannot do teacher graded activities.</div>
 
-            shadow.querySelectorAll('.api-card').forEach(row => {
-                const input = row.querySelector('.api-key-input');
-                const toggleBtn = row.querySelector('.api-toggle-vis');
-                const deleteBtn = row.querySelector('.api-delete-key');
-                const statusEl = row.querySelector('.api-status');
-                const provider = row.dataset.provider;
+                    <div class="faq-q">Is the AI 100% perfect?</div>
+                    <div class="faq-a">No, the AI is not 100% perfect. You can turn on Confirm Before Submit option in the UI so you can check the AI's answers.</div>
 
-                toggleBtn.addEventListener('click', () => {
-                    input.type = input.type === 'password' ? 'text' : 'password';
-                });
+                    <div class="faq-q">How do range delays work?</div>
+                    <div class="faq-a">Enter e.g. <code>25-35</code> to pick a random delay between 25s and 35s.</div>
 
-                deleteBtn.addEventListener('click', () => {
-                    if (confirm(`Are you sure you want to delete your ${provider} API key?`)) {
-                        Ed.Config.set(`${provider}_key`, '');
-                        input.value = '';
-                        statusEl.className = 'api-status';
-                        statusEl.textContent = '';
-                        Ed.UI.showToast(`${provider} key deleted.`, 2000);
-                    }
-                });
+                    <div class="faq-q">Why does the script randomly pause?</div>
+                    <div class="faq-a">It will pause if "Confirm Before Submit" is enabled or if rate limits (5 requests/min) are active. It automatically ticks down to continue.</div>
 
-                input.addEventListener('change', async () => {
-                    const val = input.value.trim();
-                    if (val) {
+                    <div class="faq-q">How do I get Desktop Notifications?</div>
+                    <div class="faq-a">Enable Auto Notify and allow system permissions in your browser.</div>
+                </div></div>
+            </div>
+        `;
+        shadow.appendChild(p);
+
+        const panelBody = shadow.getElementById('panel-body');
+        if (Ed.Config.get("UI_COLLAPSED", false)) panelBody.classList.add('hidden');
+
+        const cerebrasInput = shadow.getElementById('api-cerebras-input');
+        if (cerebrasInput) cerebrasInput.value = Ed.Config.safeGetKey("cerebras_key");
+
+        shadow.querySelectorAll('.api-card').forEach(row => {
+            const input = row.querySelector('.api-key-input');
+            const toggleBtn = row.querySelector('.api-toggle-vis');
+            const deleteBtn = row.querySelector('.api-delete-key');
+            const statusEl = row.querySelector('.api-status');
+            const provider = row.dataset.provider;
+
+            toggleBtn.addEventListener('click', () => {
+                input.type = input.type === 'password' ? 'text' : 'password';
+            });
+
+            deleteBtn.addEventListener('click', () => {
+                if (confirm(`Are you sure you want to delete your ${provider} API key?`)) {
+                    Ed.Config.set(`${provider}_key`, '');
+                    input.value = '';
+                    statusEl.className = 'api-status';
+                    statusEl.textContent = '';
+                    Ed.UI.showToast(`${provider} key deleted.`, 2000);
+                }
+            });
+
+            input.addEventListener('change', async () => {
+                const val = input.value.trim();
+                if (val) {
+                    statusEl.className = 'api-status validating';
+                    statusEl.textContent = '⏳ Validating...';
+
+                    const result = await Ed.AI.validateKey(provider, val);
+
+                    if (result.valid) {
+                        statusEl.className = 'api-status success';
+                        statusEl.textContent = '✅ Key is valid and saved.';
+                        Ed.Config.set(`${provider}_key`, Ed.Config.encode(val));
+                        Ed.UI.showToast(`${provider} key updated.`, 2000);
+                    } else if (result.valid === null) {
                         statusEl.className = 'api-status validating';
-                        statusEl.textContent = '⏳ Validating...';
-
-                        const result = await Ed.AI.validateKey(provider, val);
-
-                        if (result.valid) {
-                            statusEl.className = 'api-status success';
-                            statusEl.textContent = '✅ Key is valid and saved.';
-                            Ed.Config.set(`${provider}_key`, Ed.Config.encode(val));
-                            Ed.UI.showToast(`${provider} key updated.`, 2000);
-                        } else if (result.valid === null) {
-                            statusEl.className = 'api-status validating';
-                            statusEl.style.color = '#f59e0b';
-                            statusEl.textContent = '⚠️ Could not verify (network error). Saved anyway.';
-                            Ed.Config.set(`${provider}_key`, Ed.Config.encode(val));
-                        } else {
-                            statusEl.className = 'api-status error';
-                            statusEl.textContent = `❌ ${result.error}`;
-                            Ed.Config.set(`${provider}_key`, Ed.Config.encode(val));
-                        }
+                        statusEl.style.color = '#f59e0b';
+                        statusEl.textContent = '⚠️ Could not verify (network error). Saved anyway.';
+                        Ed.Config.set(`${provider}_key`, Ed.Config.encode(val));
                     } else {
-                        Ed.Config.set(`${provider}_key`, '');
-                        statusEl.className = 'api-status';
-                        statusEl.textContent = '';
+                        statusEl.className = 'api-status error';
+                        statusEl.textContent = `❌ ${result.error}`;
+                        Ed.Config.set(`${provider}_key`, Ed.Config.encode(val));
                     }
-                });
+                } else {
+                    Ed.Config.set(`${provider}_key`, '');
+                    statusEl.className = 'api-status';
+                    statusEl.textContent = '';
+                }
             });
+        });
 
-            const resumeBtn = shadow.getElementById('ed-resume-btn');
-            resumeBtn.addEventListener('click', () => {
-                Ed.State.manuallyPausedSubmission = false;
-                resumeBtn.style.display = 'none';
-                Ed.UI.showToast("Resuming submission...", 2000);
-                Ed.Answer.clickSubmitOrNext();
+        const resumeBtn = shadow.getElementById('ed-resume-btn');
+        resumeBtn.addEventListener('click', () => {
+            Ed.State.manuallyPausedSubmission = false;
+            resumeBtn.style.display = 'none';
+            Ed.UI.showToast("Resuming submission...", 2000);
+            Ed.Answer.clickSubmitOrNext();
+        });
+
+        shadow.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                shadow.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                shadow.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                tab.classList.add('active');
+                shadow.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
             });
+        });
 
-            shadow.querySelectorAll('.tab').forEach(tab => {
-                tab.addEventListener('click', () => {
-                    shadow.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                    shadow.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                    tab.classList.add('active');
-                    shadow.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
-                });
+        shadow.querySelectorAll('.row').forEach(row => {
+            row.addEventListener('click', (e) => {
+                if (e.target.tagName === 'SELECT') return;
+                if (e.target.classList.contains('delay-input')) return;
+                const toggle = row.querySelector('.toggle');
+                if (!toggle) return;
+
+                const key = row.dataset.key;
+                const isActive = !toggle.classList.contains('active');
+                if (isActive) toggle.classList.add('active'); else toggle.classList.remove('active');
+                Ed.Config.set(key, isActive);
+
+                if (key === "AUTO_NOTIFY" && isActive) Ed.Notifications.requestPermAndShowModal();
+                if (key === "BACKGROUND_MODE") Ed.Recovery.toggleAntiThrottle(isActive);
+                if (key === "AUTOHIDE_ENABLED") Ed.UI.toggleAutoHide(isActive);
+                if (key === "CEREBRAS_REASONING") {
+                    Ed.UI.showToast(`Reasoning ${isActive ? 'enabled' : 'disabled'}.`, 2000);
+                }
+
+                if (key === "AUTO_ANSWER_ENABLED") {
+                    if (isActive) Ed.Answer.startAnswer(false);
+                    else Ed.Answer.stopAnswer();
+                }
+                if (key === "AUTO_TUTORIAL_ENABLED") {
+                    if (isActive) Ed.Tutorial.tryStartTutorial();
+                    else Ed.Tutorial.disableTutorialMode();
+                }
             });
+        });
 
-            shadow.querySelectorAll('.row').forEach(row => {
-                row.addEventListener('click', (e) => {
-                    if (e.target.tagName === 'SELECT') return;
-                    if (e.target.classList.contains('delay-input')) return;
-                    const toggle = row.querySelector('.toggle');
-                    if (!toggle) return;
-
-                    const key = row.dataset.key;
-                    const isActive = !toggle.classList.contains('active');
-                    if (isActive) toggle.classList.add('active'); else toggle.classList.remove('active');
-                    Ed.Config.set(key, isActive);
-
-                    if (key === "AUTO_NOTIFY" && isActive) Ed.Notifications.requestPermAndShowModal();
-                    if (key === "BACKGROUND_MODE") Ed.Recovery.toggleAntiThrottle(isActive);
-                    if (key === "AUTOHIDE_ENABLED") Ed.UI.toggleAutoHide(isActive);
-
-                    if (key === "AUTO_ANSWER_ENABLED") {
-                        if (isActive) Ed.Answer.startAnswer(false);
-                        else Ed.Answer.stopAnswer();
-                    }
-                    if (key === "AUTO_TUTORIAL_ENABLED") {
-                        if (isActive) Ed.Tutorial.tryStartTutorial();
-                        else Ed.Tutorial.disableTutorialMode();
-                    }
-                });
+        shadow.querySelectorAll('.delay-input').forEach(input => {
+            input.addEventListener('click', (e) => e.stopPropagation());
+            input.addEventListener('mousedown', (e) => e.stopPropagation());
+            input.addEventListener('change', (e) => {
+                let val = e.target.value.trim();
+                if (!/^(\d+)(-\d+)?$/.test(val)) val = "5";
+                e.target.value = val;
+                Ed.Config.set(e.target.dataset.delay, val);
             });
-
-            shadow.querySelectorAll('.delay-input').forEach(input => {
-                input.addEventListener('click', (e) => e.stopPropagation());
-                input.addEventListener('mousedown', (e) => e.stopPropagation());
-                input.addEventListener('change', (e) => {
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
                     let val = e.target.value.trim();
                     if (!/^(\d+)(-\d+)?$/.test(val)) val = "5";
                     e.target.value = val;
                     Ed.Config.set(e.target.dataset.delay, val);
-                });
-                input.addEventListener('keydown', (e) => {
-                    if (e.key === 'Enter') {
-                        e.preventDefault();
-                        let val = e.target.value.trim();
-                        if (!/^(\d+)(-\d+)?$/.test(val)) val = "5";
-                        e.target.value = val;
-                        Ed.Config.set(e.target.dataset.delay, val);
-                        e.target.blur();
-                    }
-                });
+                    e.target.blur();
+                }
             });
+        });
 
-                        shadow.getElementById('collapse-btn').addEventListener('click', (e) => {
-                e.stopPropagation();
-                const nowHidden = panelBody.classList.toggle('hidden');
-                Ed.Config.set("UI_COLLAPSED", nowHidden);
-            });
-            shadow.getElementById('hide-btn').addEventListener('click', (e) => {
-                e.stopPropagation();
-                host.style.display = 'none';
-            });
+        shadow.getElementById('collapse-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            const nowHidden = panelBody.classList.toggle('hidden');
+            Ed.Config.set("UI_COLLAPSED", nowHidden);
+        });
+        shadow.getElementById('hide-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            host.style.display = 'none';
+        });
 
-            let isDragging = false, startX, startY; const header = p.querySelector('.header');
-            const onMove = (e) => {
-                if (!isDragging) return;
-                host.style.right = 'auto';
-                let newX = Math.max(-host.offsetWidth + 60, Math.min(e.clientX - startX, window.innerWidth - 60));
-                let newY = Math.max(0, Math.min(e.clientY - startY, window.innerHeight - 40));
-                host.style.left = newX + 'px';
-                host.style.top = newY + 'px';
-            };
-            const onUp = () => {
-                isDragging = false;
-                document.removeEventListener('mousemove', onMove);
-                document.removeEventListener('mouseup', onUp);
-                Ed.Config.set("UI_POSITION", { left: host.style.left, top: host.style.top });
-            };
-            header.addEventListener('mousedown', (e) => { if (e.target.closest('.header-btns')) return; isDragging = true; startX = e.clientX - host.offsetLeft; startY = e.clientY - host.offsetTop; document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp); });
+        let isDragging = false, startX, startY; const header = p.querySelector('.header');
+        const onMove = (e) => {
+            if (!isDragging) return;
+            host.style.right = 'auto';
+            let newX = Math.max(-host.offsetWidth + 60, Math.min(e.clientX - startX, window.innerWidth - 60));
+            let newY = Math.max(0, Math.min(e.clientY - startY, window.innerHeight - 40));
+            host.style.left = newX + 'px';
+            host.style.top = newY + 'px';
+        };
+        const onUp = () => {
+            isDragging = false;
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+            Ed.Config.set("UI_POSITION", { left: host.style.left, top: host.style.top });
+        };
+        header.addEventListener('mousedown', (e) => { if (e.target.closest('.header-btns')) return; isDragging = true; startX = e.clientX - host.offsetLeft; startY = e.clientY - host.offsetTop; document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp); });
+    }
+};
+
+// ========================================================================
+// AUTO ACTIVITY URL WATCHER
+// ========================================================================
+let lastUrl = location.href;
+new MutationObserver(() => {
+    if (location.href !== lastUrl) {
+        lastUrl = location.href;
+        setTimeout(() => {
+            if (Ed.Config.get('AUTO_ACTIVITY_ENABLED', false) || Ed.Config.get('AUTO_ADVANCE_ENABLED', false)) Ed.Nav.autoNavigate();
+            if (Ed.Config.get('AUTO_TUTORIAL_ENABLED', false)) Ed.Tutorial.tryStartTutorial();
+        }, 2000);
+    }
+}).observe(document, { subtree: true, childList: true });
+
+// ========================================================================
+// INITIALIZATION
+// ========================================================================
+if (window.self === window.top && !Ed.Utils.isLoginPage()) {
+    window.addEventListener('load', async () => {
+        if (!Ed.Config.safeGetKey("cerebras_key")) {
+            await Ed.UI.showSetupModal();
         }
-    };
 
-    // ========================================================================
-    // AUTO ACTIVITY URL WATCHER
-    // ========================================================================
-    let lastUrl = location.href;
-    new MutationObserver(() => {
-        if (location.href !== lastUrl) {
-            lastUrl = location.href;
-            setTimeout(() => {
-                if (Ed.Config.get('AUTO_ACTIVITY_ENABLED', false) || Ed.Config.get('AUTO_ADVANCE_ENABLED', false)) Ed.Nav.autoNavigate();
-                if (Ed.Config.get('AUTO_TUTORIAL_ENABLED', false)) Ed.Tutorial.tryStartTutorial();
-            }, 2000);
-        }
-    }).observe(document, { subtree: true, childList: true });
+        Ed.UI.initUI();
+        await Ed.UI.showRecommendedSettingsModal();
 
-    // ========================================================================
-    // INITIALIZATION
-    // ========================================================================
-    if (window.self === window.top && !Ed.Utils.isLoginPage()) {
-        window.addEventListener('load', async () => {
-            if (!Ed.Config.safeGetKey("cerebras_key") && !Ed.Config.safeGetKey("groq_key")) {
-                await Ed.UI.showSetupModal();
+        if (Ed.Config.get('BACKGROUND_MODE', false)) Ed.Recovery.toggleAntiThrottle(true);
+        if (Ed.Config.get('AUTOHIDE_ENABLED', false)) Ed.UI.toggleAutoHide(true);
+
+        // Periodic background check so you NEVER need to reload to AutoAdvance
+        setInterval(() => {
+            if (!Ed.State.tutorialRunning && Ed.Config.get('AUTO_TUTORIAL_ENABLED', false)) {
+                Ed.Tutorial.tryStartTutorial();
             }
 
-            Ed.UI.initUI();
-            await Ed.UI.showRecommendedSettingsModal();
-
-            if (Ed.Config.get('BACKGROUND_MODE', false)) Ed.Recovery.toggleAntiThrottle(true);
-            if (Ed.Config.get('AUTOHIDE_ENABLED', false)) Ed.UI.toggleAutoHide(true);
-
-            // Periodic background check so you NEVER need to reload to AutoAdvance
-                        setInterval(() => {
-                if (!Ed.State.tutorialRunning && Ed.Config.get('AUTO_TUTORIAL_ENABLED', false)) {
-                    Ed.Tutorial.tryStartTutorial();
-                }
-
-                if (!Ed.State.tutorialRunning && (Ed.Config.get('AUTO_ACTIVITY_ENABLED', false) || Ed.Config.get('AUTO_ADVANCE_ENABLED', false))) {
-                    Ed.Nav.autoNavigate();
-                }
-            }, 3000);
+            if (!Ed.State.tutorialRunning && (Ed.Config.get('AUTO_ACTIVITY_ENABLED', false) || Ed.Config.get('AUTO_ADVANCE_ENABLED', false))) {
+                Ed.Nav.autoNavigate();
+            }
+        }, 3000);
 
 
-            setTimeout(() => {
-                if (Ed.Config.get('AUTO_ACTIVITY_ENABLED', false)) Ed.Nav.autoNavigate();
-                if (Ed.Config.get('AUTO_TUTORIAL_ENABLED', false)) Ed.Tutorial.tryStartTutorial();
-                if (Ed.Config.get('AUTO_ANSWER_ENABLED', false)) Ed.Answer.startAnswer(true);
-            }, 2000);
-        });
-    }
+        setTimeout(() => {
+            if (Ed.Config.get('AUTO_ACTIVITY_ENABLED', false)) Ed.Nav.autoNavigate();
+            if (Ed.Config.get('AUTO_TUTORIAL_ENABLED', false)) Ed.Tutorial.tryStartTutorial();
+            if (Ed.Config.get('AUTO_ANSWER_ENABLED', false)) Ed.Answer.startAnswer(true);
+        }, 2000);
+    });
+}
 
 })();
