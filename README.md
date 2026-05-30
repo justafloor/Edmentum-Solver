@@ -78,3 +78,4 @@ Thanks to **j01t3d** for the tutorial skipping logic. You can find [their origin
 If you have any issues, concerns, or questions regarding the script, feel free to contact me:
 
 * **Discord:** `justafloor23`
+* **Reddit:** `Ok_Parking_4605`
