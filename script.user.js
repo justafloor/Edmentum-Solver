@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Edmentum Solver - V1.1.0
+// @name         Edmentum Solver - V1.1.1
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.1.1
 // @description  Automates Edmentum.
 // @author       Floor
 // @match        *://*.apps.elf.edmentum.com/*
@@ -518,33 +518,32 @@
 // Disable reasoning for this specific request if the AI was too chatty and kept getting truncated
 const useReasoning = globalReasoningEnabled && !data._forceNoReasoning;
 
-// Dynamic system prompt modifications if a truncation event was recorded
-let systemContent = 'You are Z.ai GLM-4.7, an elite, highly logical expert tutor optimized for US grades 6-12 across all academic subjects (Mathematics, Science, English Language Arts, Social Studies, and History). Your goal is absolute 100% accuracy.';
-if (useReasoning) {
-systemContent += '\nSince reasoning is enabled, analyze the question deeply inside your thinking phase. Carefully parse all questions, diagrams, and options. Verify math calculations and context before formulating the final answer.';
-} else {
-systemContent += '\nReasoning is disabled for this attempt to prevent length cutoffs. Provide the most accurate answer directly. Carefully parse all questions, diagrams, and options.';
-}
-if (data._shortRetry) {
+// Dynamic system prompt modifications with front-loaded format rules and English control
+                    let systemContent = 'You MUST STRICTLY structure your final content output using EXACTLY this two-part format:\n\n[REASONING]\n(Provide a brief validation of your logic. You are REQUIRED to act as your own rigorous critic to find potential pitfalls in your math or reasoning before finalizing)\n[/REASONING]\n\n[FINAL ANSWER]\n(Provide ONLY the final answer as requested, with NO other text or formatting, matching the options exactly)\n- Single choice: output exactly one capital letter (e.g., B).\n- Multiple choice: output capital letters separated by commas (e.g., A,C).\n- Math/Numbers: output only the exact numbers/expressions separated by commas (e.g., 5,12.5,-3).\n- Drag/Drop: output the exact tile text separated by commas.\n[/FINAL ANSWER]\n\nYou MUST think, reason, and output strictly in English.\n\nRole: You are Z.ai GLM-4.7, an elite academic evaluation expert optimized for US grades 6-12 across all subjects. Your REQUIRED goal is absolute accuracy.';
+                    if (useReasoning) {
+                        systemContent += '\n\nSince reasoning is enabled, you MUST analyze the question deeply inside your thinking phase. Carefully parse all questions, diagrams, and options. Verify math calculations and context before formulating the final answer.';
+                    } else {
+                        systemContent += '\n\nReasoning is disabled for this attempt to prevent length cutoffs. You MUST provide the most accurate answer directly without detailed reasoning. Carefully parse all questions, diagrams, and options.';
+                    }
+                    if (data._shortRetry) {
                         systemContent += '\n\nCRITICAL CONSTRAINTS: Your previous response ran too long and got cut off. You MUST be extremely concise on this attempt. Keep your [REASONING] block to under 2 sentences. Deliver your [FINAL ANSWER] as fast as possible to avoid truncation.';
                     }
 
-                    systemContent += '\n\nYou must structure your final content output using EXACTLY this two-part format:\n\n[REASONING]\n(Provide a brief explanation of your logical deduction steps here to verify accuracy)\n[/REASONING]\n\n[FINAL ANSWER]\n(Provide ONLY the final answer as requested, with NO other text or formatting, matching the options exactly)\n- Single choice: output exactly one capital letter (e.g., B).\n- Multiple choice: output capital letters separated by commas (e.g., A,C).\n- Math/Numbers: output only the exact numbers/expressions separated by commas (e.g., 5,12.5,-3).\n- Drag/Drop: output the exact tile text separated by commas.\n[/FINAL ANSWER]';
-
-                    const body = {
-model: model,
-messages: [
-{ role: 'system', content: systemContent },
-{ role: 'user', content: promptContent }
-],
-max_completion_tokens: 8192,
-temperature: 0
-};
-if (!useReasoning) {
-body.reasoning_effort = "none";
-} else {
-body.reasoning_format = "raw";
-}
+const body = {
+                        model: model,
+                        messages: [
+                            { role: 'system', content: systemContent },
+                            { role: 'user', content: promptContent }
+                        ],
+                        max_completion_tokens: 8192,
+                        temperature: useReasoning ? 0.8 : 0.0,
+                        top_p: 0.95
+                    };
+                    if (!useReasoning) {
+                        body.reasoning_effort = "none";
+                    } else {
+                        body.reasoning_format = "raw";
+                    }
                     const res = await fetch(url, {
                         method: 'POST',
                         signal: controller.signal,
@@ -1526,42 +1525,29 @@ body.reasoning_format = "raw";
             const suffix = strictSuffix + shortSuffix;
 
             if (data.type === 'mcq') {
-                let prompt = wrongFeedback + `Answer this multiple choice question with ONLY the letter (A, B, C, D, etc.) of the correct choice.\n\nQuestion:\n${data.question}${imgSection}\n\nChoices:\n`;
+                let prompt = wrongFeedback + `You are REQUIRED to solve this multiple-choice question. Select the correct choice.\n\nQuestion:\n${data.question}${imgSection}\n\nChoices:\n`;
                 data.choices.forEach(c => {
                     prompt += `${c.letter}) ${c.text}\n`;
                 });
-                       prompt += `
-Respond with ONLY the letter. No explanation. No punctuation. No extra text of any kind.` + suffix;
-       return prompt;
-   }
-   if (data.type === 'multiresponse') {
-       let prompt = wrongFeedback + `Answer this multiple response question. Select ALL correct options.
-Question:
-${data.question}${imgSection}
-Choices:
-`;
-       data.choices.forEach(c => {
-           prompt += `${c.letter}) ${c.text}
-`;
-       });
-       prompt += `
-Respond with ONLY the letters of the correct choices, separated by commas (e.g., A,C). No explanation. No extra text.` + suffix;
-       return prompt;
-   }
-   if (data.type === 'hottext') {
-       let prompt = wrongFeedback + `Answer this text selection question. Select the correct phrase(s) from the options.
-Question:
-${data.question}${imgSection}
-Options:
-`;
-       data.choices.forEach(c => {
-           prompt += `${c.letter}) ${c.text}
-`;
-       });
-       prompt += `
-Respond with ONLY the letter(s) of the correct option(s), separated by commas if multiple. No explanation. No extra text.` + suffix;
-       return prompt;
-   }
+                prompt += `\nYou MUST STRICTLY output ONLY the single capital letter of the correct option inside the final answer tags. No punctuation. No extra text.` + suffix;
+                return prompt;
+            }
+            if (data.type === 'multiresponse') {
+                let prompt = wrongFeedback + `You are REQUIRED to solve this multiple-response question. Select ALL options that apply.\n\nQuestion:\n${data.question}${imgSection}\n\nChoices:\n`;
+                data.choices.forEach(c => {
+                    prompt += `${c.letter}) ${c.text}\n`;
+                });
+                prompt += `\nYou MUST STRICTLY respond with ONLY the capital letters of the correct options, separated by commas (e.g., A,C). No other text.` + suffix;
+                return prompt;
+            }
+            if (data.type === 'hottext') {
+                let prompt = wrongFeedback + `You are REQUIRED to solve this text-selection question. Select the correct phrase(s) from the options.\n\nQuestion:\n${data.question}${imgSection}\n\nOptions:\n`;
+                data.choices.forEach(c => {
+                    prompt += `${c.letter}) ${c.text}\n`;
+                });
+                prompt += `\nYou MUST STRICTLY respond with ONLY the capital letter(s) of the correct options, separated by commas if multiple. No explanation or conversation.` + suffix;
+                return prompt;
+            }
       if (data.type === 'ggm') {
        let prompt = wrongFeedback + `You are answering a drag-and-drop categorization question.
 Question:
@@ -4395,7 +4381,7 @@ clickSubmitOrNext: async (preferredDoc) => {
         const reasoningActive = Ed.Config.get("CEREBRAS_REASONING", true) ? 'active' : '';
 
         p.innerHTML = `
-            <div class="header"><div class="logo">E</div><div class="title">Edmentum Solver <span id="version-tag" style="font-size: 10px; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; margin-left: 8px; font-weight: 500;">v1.1.0</span></div><div class="header-btns"><button class="header-btn" id="collapse-btn">—</button><button class="header-btn" id="hide-btn">✕</button></div></div>
+            <div class="header"><div class="logo">E</div><div class="title">Edmentum Solver <span id="version-tag" style="font-size: 10px; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; margin-left: 8px; font-weight: 500;">v1.1.1</span></div><div class="header-btns"><button class="header-btn" id="collapse-btn">—</button><button class="header-btn" id="hide-btn">✕</button></div></div>
             <div id="panel-body">
                <div class="tabs">
                     <div class="tab active" data-tab="features"><svg viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Features</div>
@@ -4491,7 +4477,7 @@ clickSubmitOrNext: async (preferredDoc) => {
                     </div>
                 </div>
                 <div class="tab-content" id="tab-about"><div class="about-content">
-                    <div class="about-title">Edmentum Solver v1.1.0</div>
+                    <div class="about-title">Edmentum Solver v1.1.1</div>
                     <div style="margin-bottom: 10px;">Made by floor with AI.<br>Press <strong>Alt + H</strong> to hide UI (Shift+Alt+H for permanent hide).</div>
 
                     <div class="section-divider"></div>
