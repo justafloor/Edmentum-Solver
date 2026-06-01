@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Edmentum Solver - V1.1.1
+// @name         Edmentum Solver - V1.2.0
 // @namespace    http://tampermonkey.net/
-// @version      1.1.1
+// @version      1.2.0
 // @description  Automates Edmentum.
 // @author       Floor
 // @match        *://*.apps.elf.edmentum.com/*
@@ -14,9 +14,10 @@
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @connect      api.cerebras.ai
+// @connect      api.groq.com
 // @run-at       document-start
-// @downloadURL https://update.greasyfork.org/scripts/578793/Edmentum%20Solver%20-%20V110.user.js
-// @updateURL https://update.greasyfork.org/scripts/578793/Edmentum%20Solver%20-%20V110.meta.js
+// @downloadURL https://update.greasyfork.org/scripts/578793/Edmentum%20Solver%20-%20V111.user.js
+// @updateURL https://update.greasyfork.org/scripts/578793/Edmentum%20Solver%20-%20V111.meta.js
 // ==/UserScript==
 
 (function() {
@@ -446,6 +447,124 @@
             });
         },
 
+        validateGroqKey: async (key) => {
+            return new Promise((resolve) => {
+                GM_xmlhttpRequest({
+                    method: "POST",
+                    url: "https://api.groq.com/openai/v1/chat/completions",
+                    headers: {
+                        "Authorization": `Bearer ${key}`,
+                        "Content-Type": "application/json"
+                    },
+                    data: JSON.stringify({
+                        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+                        messages:[{ role: "user", content: "test" }],
+                        max_tokens: 1
+                    }),
+                    timeout: 15000,
+                    onload: (response) => {
+                        if (response.status === 401 || response.status === 403) {
+                            resolve({ valid: false, error: "Invalid Groq API Key" });
+                        } else if (response.status >= 200 && response.status < 300) {
+                            resolve({ valid: true, error: null });
+                        } else {
+                            resolve({ valid: false, error: `Groq returned status ${response.status}` });
+                        }
+                    },
+                    onerror: () => resolve({ valid: null, error: "Network error" }),
+                    ontimeout: () => resolve({ valid: null, error: "Timed out" })
+                });
+            });
+        },
+
+        describeImagesWithGroq: async (images, questionText) => {
+            const groqKey = Ed.Config.safeGetKey('groq_key');
+            if (!groqKey) {
+                Ed.Utils.log.warn("No Groq key configured. Skipping image vision pre-analysis...");
+                return "";
+            }
+
+            const rasterImages = images.filter(img => (img.type === 'img' || img.type === 'bg') && img.src && !img.src.includes('.svg'));
+            if (rasterImages.length === 0) return "";
+
+            Ed.UI.showToast(`Analyzing ${rasterImages.length} image(s) with Groq Vision...`, 3000);
+            Ed.Utils.log.info(`[Groq API Call Started] Outgoing request containing ${rasterImages.length} educational image(s) is bypassing browser CORS and executing through Tampermonkey context thread (masked from page-level Network panel). Check background console for response stream.`);
+
+            let descriptions = [];
+            for (let i = 0; i < rasterImages.length; i++) {
+                const img = rasterImages[i];
+                try {
+                    const base64Data = await Ed.Parsers.imageToBase64(img.src);
+                    if (!base64Data) continue;
+
+                    const responseText = await new Promise((resolve, reject) => {
+                        GM_xmlhttpRequest({
+                            method: "POST",
+                            url: "https://api.groq.com/openai/v1/chat/completions",
+                            headers: {
+                                "Authorization": `Bearer ${groqKey}`,
+                                "Content-Type": "application/json"
+                            },
+                            data: JSON.stringify({
+                                model: "meta-llama/llama-4-scout-17b-16e-instruct",
+                                messages: [
+                                    {
+                                        role: "user",
+                                        content: [
+                                            {
+                                                type: "text",
+                                                text: `Analyze this image with maximum rigor for an academic AI solver. You must act as the "Vision Engine", providing the ultimate set of visual instructions and extracted data to the main text-based AI.
+1. Extract ALL text, numbers, formulas, tables, labels, and choices verbatim.
+2. Map out all spatial relationships, graphs, coordinates, geometric shapes, angles, side lengths, and diagram structures clearly.
+3. Explicitly state what visual information is CRITICAL for solving the question.
+4. Conclude with a direct, highly explicit instruction summarizing exactly what the text-based solver must focus on based on this visual evidence.
+
+Keep the output highly structured, systematic, and unambiguous.
+
+Context question text for reference:\n"${questionText}"`
+                                            },
+                                            {
+                                                type: "image_url",
+                                                image_url: {
+                                                    url: base64Data
+                                                }
+                                            }
+                                        ]
+                                    }
+                                ],
+                                max_tokens: 1536,
+                                temperature: 0.2
+                            }),
+                            onload: (res) => {
+                                if (res.status >= 200 && res.status < 300) {
+                                    try {
+                                        const parsed = JSON.parse(res.responseText);
+                                        resolve(parsed.choices?.[0]?.message?.content || "");
+                                    } catch (err) {
+                                        reject(err);
+                                    }
+                                } else {
+                                    reject(new Error(`Groq returned status ${res.status}: ${res.responseText}`));
+                                }
+                            },
+                            onerror: (err) => reject(err)
+                        });
+                    });
+
+                    if (responseText) {
+                        descriptions.push(`[Image ${i + 1} Analysis]: ${responseText}`);
+                    }
+                } catch (e) {
+                    Ed.Utils.log.error("Groq vision analysis failed for image:", img.src, e);
+                }
+            }
+
+            if (descriptions.length > 0) {
+                return "\n\n=== VISION LAYER: DETAILED GRAPHICAL DESCRIPTIONS (FROM GROQ MULTIMODAL ANALYSIS) ===\n" + descriptions.join("\n\n") + "\n=================================================================================\n";
+            }
+            return "";
+        },
+
         cleanAIResponse: (text) => {
             // 1. Extract the actual final answer appended after the model's native thinking phase
             if (text.includes('</think>')) {
@@ -491,6 +610,13 @@
                 return;
             }
 
+            // Check and process only genuine educational assets, omitting page wrappers and menu interfaces
+            const realImages = Ed.Parsers.getRealImages(data.images);
+            let visionLayerText = "";
+            if (realImages.length > 0) {
+                visionLayerText = await Ed.AI.describeImagesWithGroq(realImages, data.question);
+            }
+
             while (true) {
                 if (!Ed.State.answerRunning) throw new Error('STOPPED');
 
@@ -498,15 +624,19 @@
                 const model = Ed.Config.CEREBRAS_MODEL;
                 const url = Ed.Config.API_ENDPOINTS.CEREBRAS;
 
-               // Estimate prompt context length to check Tokens Per Minute limitations pre-request
-                const promptContent = Ed.Parsers.buildPrompt(data);
-                const estimatedTokens = Math.ceil(promptContent.length / 3) + 8192;
+                // Build prompt and explicitly direct Cerebras to utilize Groq's structural details
+                let promptContent = Ed.Parsers.buildPrompt(data);
+                if (visionLayerText) {
+                    promptContent = `[CRITICAL DIRECTIVE: The diagrams present in this academic task have been analyzed by the Groq Multimodal Vision Engine. Rely strictly on the spatial descriptors, measurements, text labels, and geometric shapes outlined in the [VISION LAYER] section below to select the correct answer!]\n\n` + promptContent + "\n\n" + visionLayerText;
+                }
+
+                const estimatedTokens = Math.ceil(promptContent.length / 3) + 4096;
 
                 try {
                     await Ed.AI.checkRateLimit(estimatedTokens);
                     if (!Ed.State.answerRunning) throw new Error('STOPPED');
 
-                    Ed.UI.showToast(`Asking Cerebras GLM 4.7...`, 3000);
+                    Ed.UI.showToast(`Asking Cerebras...`, 0);
 
                     // Prints the prompt directly to your browser's Developer Console
                     Ed.Utils.log.info("Cerebras Outgoing Prompt:", promptContent);
@@ -515,18 +645,50 @@
                     const timeoutId = setTimeout(() => controller.abort(), 60000);
 
                     const globalReasoningEnabled = Ed.Config.get("CEREBRAS_REASONING", true);
-// Disable reasoning for this specific request if the AI was too chatty and kept getting truncated
-const useReasoning = globalReasoningEnabled && !data._forceNoReasoning;
+                    // Keep reasoning active during early retries, deactivating ONLY on subsequent errors as a last resort
+                    const useReasoning = globalReasoningEnabled && !Ed.State.forceNoReasoning;
 
-// Dynamic system prompt modifications with front-loaded format rules and English control
-                    let systemContent = 'You MUST STRICTLY structure your final content output using EXACTLY this two-part format:\n\n[REASONING]\n(Provide a brief validation of your logic. You are REQUIRED to act as your own rigorous critic to find potential pitfalls in your math or reasoning before finalizing)\n[/REASONING]\n\n[FINAL ANSWER]\n(Provide ONLY the final answer as requested, with NO other text or formatting, matching the options exactly)\n- Single choice: output exactly one capital letter (e.g., B).\n- Multiple choice: output capital letters separated by commas (e.g., A,C).\n- Math/Numbers: output only the exact numbers/expressions separated by commas (e.g., 5,12.5,-3).\n- Drag/Drop: output the exact tile text separated by commas.\n[/FINAL ANSWER]\n\nYou MUST think, reason, and output strictly in English.\n\nRole: You are Z.ai GLM-4.7, an elite academic evaluation expert optimized for US grades 6-12 across all subjects. Your REQUIRED goal is absolute accuracy.';
-                    if (useReasoning) {
-                        systemContent += '\n\nSince reasoning is enabled, you MUST analyze the question deeply inside your thinking phase. Carefully parse all questions, diagrams, and options. Verify math calculations and context before formulating the final answer.';
-                    } else {
-                        systemContent += '\n\nReasoning is disabled for this attempt to prevent length cutoffs. You MUST provide the most accurate answer directly without detailed reasoning. Carefully parse all questions, diagrams, and options.';
+                    // Strict, direct JSON output instructions
+                    let systemContent = '[STRICT BRIEFNESS: You are a fast, precise academic solver. Your goal is absolute accuracy. Think deeply internally to solve the problem, but keep your final output strictly limited to a single JSON block containing only the direct answer. Do not output any reasoning or explanations in the final output JSON.]\n\n' +
+                                        'You MUST answer questions by returning a valid JSON object matching this schema exactly:\n{\n  "answer": "The plain text answer matching the option or required input format (e.g., \\"B\\", \\"A,C\\", or \\"3.14\\")"\n}\n\nYou MUST think, reason, and output strictly in English.';
+
+                    if (realImages.length > 0 && (promptContent.toLowerCase().includes('geometry') || promptContent.toLowerCase().includes('diagram') || promptContent.toLowerCase().includes('triangle') || promptContent.toLowerCase().includes('angle'))) {
+                        systemContent += '\n\nGEOMETRY/VISUAL REVERSE-CONSTRAINT PROTOCOL: Rely entirely on your mathematical rule configurations combined with the [VISION LAYER] layout details provided in the prompt. Deduce the correct parameters directly from standard theorems.';
                     }
-                    if (data._shortRetry) {
-                        systemContent += '\n\nCRITICAL CONSTRAINTS: Your previous response ran too long and got cut off. You MUST be extremely concise on this attempt. Keep your [REASONING] block to under 2 sentences. Deliver your [FINAL ANSWER] as fast as possible to avoid truncation.';
+
+                    if (useReasoning) {
+                        systemContent += '\n\nSince reasoning is enabled, analyze the question deeply in your thinking phase. However, avoid circular logic loops or conversational fluff to prevent output truncation.';
+                    } else {
+                        systemContent += '\n\nReasoning is disabled to prevent truncation. Output your answers cleanly and directly in JSON format. Ensure you do not skip any of the required parts or fields listed in the prompts.';
+                    }
+
+                    // Dynamic multi-part item verification prevents the model from omitting elements (especially when reasoning is disabled)
+                    let itemQuantityDirectives = "";
+                    if (data.type === 'inlinechoice' && data.menus) {
+                        itemQuantityDirectives = `\n\n[🚨 CRITICAL TASK REQUIREMENT 🚨]\nYou are answering an inline choice dropdown question. There are exactly ${data.menus.length} dropdown menus in this question. You MUST provide exactly ${data.menus.length} choice letters (e.g., B,A,B), separated by commas, in your JSON "answer" key. (e.g., if there are 3 menus, your answer key must have exactly 3 values like "B,A,B"). Do not leave any menus unanswered!`;
+                    } else if (data.type === 'textentry' && data.inputs) {
+                        itemQuantityDirectives = `\n\n[🚨 CRITICAL TASK REQUIREMENT 🚨]\nYou are answering a fill-in-the-blank question. There are exactly ${data.inputs.length} blank input boxes in this question. You MUST provide exactly ${data.inputs.length} comma-separated text values in your JSON "answer" key. (e.g., if there are 2 boxes, your answer key must have exactly 2 values like "-3, 4"). Fill in every single box!`;
+                    } else if (data.type === 'ggm' && data.draggables && data.droppables) {
+                        itemQuantityDirectives = `\n\n[🚨 CRITICAL TASK REQUIREMENT 🚨]\nYou are answering a drag-and-drop categorization question. You MUST categorize ALL ${data.draggables.length} draggable tiles into the target categories. Do not leave any tiles out!`;
+                    } else if (data.type === 'seqresponse' && data.droppables) {
+                        itemQuantityDirectives = `\n\n[🚨 CRITICAL TASK REQUIREMENT 🚨]\nYou are answering a sequential ordering question with exactly ${data.droppables.length} target zones. You MUST list exactly ${data.droppables.length} tile letters in order for each of the ${data.droppables.length} target zones in your JSON "answer" key.`;
+                    } else if (data.type === 'mpsimple' && data.droppables) {
+                        itemQuantityDirectives = `\n\n[🚨 CRITICAL TASK REQUIREMENT 🚨]\nYou are answering a drag-and-drop matching question. There are exactly ${data.droppables.length} drop boxes. You MUST provide exactly ${data.droppables.length} tile values matching each of the drop boxes.`;
+                    } else if (data.type === 'matchedpairs' && data.leftItems) {
+                        itemQuantityDirectives = `\n\n[🚨 CRITICAL TASK REQUIREMENT 🚨]\nYou are answering a drag-and-drop pairing question. There are exactly ${data.leftItems.length} left items to pair. You MUST pair all ${data.leftItems.length} items in your output mapping.`;
+                    }
+
+                    if (itemQuantityDirectives) {
+                        systemContent += itemQuantityDirectives;
+                    }
+
+                    // Strict, tiered cutoff-prevention directives matching your preferences
+                    if (Ed.State.extendedTokens) {
+                        systemContent += '\n\n[🚨 MAXIMUM CAPACITY ALLOCATED 🚨]\nYour previous attempts ran out of tokens. We have temporarily doubled your output token limit to 16,384. Use the space necessary to conclude your logic, but provide the final JSON answer as soon as possible.';
+                    } else if (Ed.State.shortRetry && useReasoning) {
+                        systemContent += '\n\n[🚨 CUTOFF PREVENTER PROTOCOL 🚨]\nYour previous attempt ran out of output tokens and got cut off. This is your second attempt. You MUST limit your reasoning phase and JSON explanation to the absolute bare minimum (under 50 words total). Transition to the JSON output immediately!';
+                    } else if (Ed.State.shortRetry && !useReasoning) {
+                        systemContent += '\n\n[🚨 LAST RESORT NON-REASONING PROTOCOL 🚨]\nReasoning is completely disabled for this attempt. You are strictly forbidden from outputting any logic traces. Generate the final JSON answer object immediately!';
                     }
 
 const body = {
@@ -535,15 +697,36 @@ const body = {
                             { role: 'system', content: systemContent },
                             { role: 'user', content: promptContent }
                         ],
-                        max_completion_tokens: 8192,
-                        temperature: useReasoning ? 0.8 : 0.0,
-                        top_p: 0.95
+                        max_completion_tokens: Ed.State.extendedTokens ? 16384 : 8192,
+                        temperature: useReasoning ? 0.8 : 0.0, // Retain 0.8 for active reasoning, 0.0 only during non-reasoning retries
+                        top_p: 0.95,
+                        response_format: {
+                            type: "json_schema",
+                            json_schema: {
+                                name: "SolverResponse",
+                                strict: true,
+                                schema: {
+                                    type: "object",
+                                    properties: {
+                                        answer: {
+                                            type: "string",
+                                            description: "The direct plain-text answer key containing only the requested choice letter(s), coordinates, or values, strictly matching the required format."
+                                        }
+                                    },
+                                    required: ["answer"],
+                                    additionalProperties: false
+                                }
+                            }
+                        }
                     };
-                    if (!useReasoning) {
-                        body.reasoning_effort = "none";
+
+                    if (useReasoning) {
+                        body.reasoning_format = "parsed"; // Moves thinking to reasoning_content, keeping content pure JSON
+                        body.clear_thinking = true;       // Wipes model scratchpad to prevent token buildup
                     } else {
-                        body.reasoning_format = "raw";
+                        body.reasoning_effort = "none";   // Disable reasoning
                     }
+
                     const res = await fetch(url, {
                         method: 'POST',
                         signal: controller.signal,
@@ -572,30 +755,22 @@ const body = {
                         throw new Error('No choices array in response');
                     }
 
-                   const choice0 = json.choices[0];
+                    const choice0 = json.choices[0];
 
-      if (choice0?.finish_reason === 'length') {
-    // Track how many times we've attempted a shorter prompt
-    data._shortRetryCount = (data._shortRetryCount || 0) + 1;
-
-    if (data._shortRetryCount <= 2) {
-        // Flag to trigger the concise restriction on the next loop retry
-        data._shortRetry = true;
-        throw new Error(`Response truncated (length). Retrying with shorter prompt (Attempt ${data._shortRetryCount}/2)...`);
-    } else if (globalReasoningEnabled && !data._forceNoReasoning) {
-        // If it still truncates after 2 short retries, disable reasoning for this specific question
-        data._forceNoReasoning = true;
-        data._shortRetryCount = 0; // Reset counter to allow 2 more attempts without reasoning
-        data._shortRetry = true;
-        Ed.UI.showToast(`AI too chatty. Disabling reasoning for this question...`, 3000);
-        throw new Error('Response truncated. Disabling reasoning and retrying...');
-    } else {
-        // If it STILL truncates with reasoning disabled, force parse the partial response
-        Ed.Utils.log.warn(`[AI Warning] Response truncated with reasoning disabled. Forcing parse of partial response...`);
-        Ed.UI.showToast(`AI cut off again. Using partial answer...`, 3000);
-        // Let the code fall through to parse the partial response instead of throwing an error
-    }
-}
+                    if (choice0?.finish_reason === 'length') {
+                        Ed.State.shortRetryCount = (Ed.State.shortRetryCount || 0) + 1;
+                        if (Ed.State.shortRetryCount <= 1) {
+                            Ed.State.shortRetry = true;
+                            throw new Error(`Response truncated (length). Retrying with shorter prompt (Attempt ${Ed.State.shortRetryCount}/2)...`);
+                        } else if (Ed.State.shortRetryCount === 2) {
+                            Ed.State.extendedTokens = true;
+                            Ed.UI.showToast(`AI still too chatty. Extending max tokens to 16,384...`, 3000);
+                            throw new Error('Response truncated again. Extending max completion tokens and retrying...');
+                        } else {
+                            Ed.Utils.log.warn(`[AI Warning] Response truncated even with extended tokens. Forcing parse of partial response...`);
+                            Ed.UI.showToast(`AI cut off again. Using partial answer...`, 3000);
+                        }
+                    }
 
                     let answer = choice0?.message?.content
                         || choice0?.text
@@ -606,7 +781,43 @@ const body = {
                         || json.choices?.[0]?.delta?.content
                         || '';
 
-                    const trimmed = Ed.AI.cleanAIResponse(answer || '');
+                    let trimmed = "";
+                    let parsedObj = null;
+
+                    // Robustly extracts and parses JSON even if preceded by conversational text
+                    const extractAndParseJSON = (text) => {
+                        try { return JSON.parse(text.trim()); } catch(e) {}
+                        let lastBrace = text.lastIndexOf('}');
+                        if (lastBrace === -1) return null;
+                        let firstBrace = text.lastIndexOf('{', lastBrace);
+                        while (firstBrace !== -1) {
+                            const candidate = text.substring(firstBrace, lastBrace + 1);
+                            try { return JSON.parse(candidate); } catch(e) {
+                                firstBrace = text.lastIndexOf('{', firstBrace - 1);
+                            }
+                        }
+                        let start = text.indexOf('{');
+                        while (start !== -1) {
+                            let end = text.lastIndexOf('}');
+                            while (end > start) {
+                                const candidate = text.substring(start, end + 1);
+                                try { return JSON.parse(candidate); } catch(e) {
+                                    end = text.lastIndexOf('}', end - 1);
+                                }
+                            }
+                            start = text.indexOf('{', start + 1);
+                        }
+                        return null;
+                    };
+
+parsedObj = extractAndParseJSON(answer);
+                    if (parsedObj) {
+                        trimmed = parsedObj.answer || "";
+                        const reasoningText = choice0?.message?.reasoning_content || parsedObj.reasoning || "None";
+                        Ed.Utils.log.info("Cerebras Thought Reasoning:", reasoningText);
+                    } else {
+                        trimmed = Ed.AI.cleanAIResponse(answer || '');
+                    }
                     if (!trimmed) {
                         throw new Error('Empty or invalid response content');
                     }
@@ -642,16 +853,27 @@ const body = {
                             await Ed.Utils.delayAsync(1000);
                         }
                     } else if (isTokenQuota) {
-                        Ed.Utils.log.warn(`[Cerebras TPM Limit] Quota exceeded. Pausing 60s for window reset...`, e);
+                        const oldest = Ed.State.apiTimestamps && Ed.State.apiTimestamps[0];
+                        const now = Date.now();
+                        // Wait until the oldest token entry falls off the sliding window, or default to 30s
+                        let waitMs = oldest ? (oldest.timestamp + 60000) - now : 30000;
+                        if (waitMs < 5000) waitMs = 15000; // Minimum buffer safety wait of 15 seconds
 
-                        // Counts down smoothly and displays a ticking toast every second
-                        for (let i = 60; i > 0; i--) {
+                        const waitSecs = Math.ceil(waitMs / 1000);
+                        Ed.Utils.log.warn(`[Cerebras TPM Limit] Quota exceeded. Sliding wait calculated: ${waitSecs}s.`, e);
+
+                        for (let i = waitSecs; i > 0; i--) {
                             if (!Ed.State.answerRunning) throw new Error('STOPPED');
                             Ed.UI.showToast(`TPM Limit Exceeded. Pausing for ${i}s...`, 1200);
                             await Ed.Utils.delayAsync(1000);
                         }
                     } else {
-                        Ed.UI.showToast(`Cerebras error. Retrying...`, 3000);
+                        const isTruncated = e.message.includes('truncated') || e.message.includes('length') || e.message.includes('too chatty') || e.message.includes('cut off');
+                        if (isTruncated) {
+                            Ed.UI.showToast("Response too long, retrying!", 4000);
+                        } else {
+                            Ed.UI.showToast(`Cerebras error. Retrying...`, 3000);
+                        }
                         Ed.Utils.log.error(`[AI Error]`, e);
                         await Ed.Utils.delayAsync(4000);
                     }
@@ -690,6 +912,123 @@ const body = {
     // PARSERS & EXTRACTORS
     // ========================================================================
     Ed.Parsers = {
+        toLaTeX: (mathNode) => {
+            if (!mathNode) return '';
+            function convert(node) {
+                if (node.nodeType === Node.TEXT_NODE) return node.textContent.trim();
+                if (node.nodeType !== Node.ELEMENT_NODE) return '';
+                const tag = node.tagName.toLowerCase();
+                const children = Array.from(node.childNodes);
+                switch (tag) {
+                    case 'math':
+                    case 'mrow':
+                        return children.map(convert).join('');
+                    case 'mi':
+                    case 'mn':
+                        return node.textContent.trim();
+                    case 'mo':
+                        const op = node.textContent.trim();
+                        if (op === '−') return '-';
+                        if (op === '·' || op === '×') return '\\cdot ';
+                        return op;
+                    case 'mfrac':
+                        if (children.length >= 2) return `\\frac{${convert(children[0])}}{${convert(children[1])}}`;
+                        return '';
+                    case 'msup':
+                        if (children.length >= 2) return `${convert(children[0])}^{${convert(children[1])}}`;
+                        return '';
+                    case 'msub':
+                        if (children.length >= 2) return `${convert(children[0])}_{${convert(children[1])}}`;
+                        return '';
+                    case 'msqrt':
+                        return `\\sqrt{${children.map(convert).join('')}}`;
+                    case 'mroot':
+                        if (children.length >= 2) return `\\sqrt[${convert(children[1])}]{${convert(children[0])}}`;
+                        return '';
+                    default:
+                        return children.map(convert).join(' ');
+                }
+            }
+            return `$${convert(mathNode).replace(/\s+/g, ' ').trim()}$`;
+        },
+
+        findGlobalReadingContext: () => {
+            let combinedPassage = "";
+            Ed.Utils.getDocs().forEach(d => {
+                const passages = d.querySelectorAll('.passage, .reading-passage, .article-content, [class*="passage"]');
+                passages.forEach(p => {
+                    if (Ed.Utils.isVisible(p, d)) {
+                        const text = Ed.Parsers.getVisibleText(p);
+                        if (text && text.length > 50 && !combinedPassage.includes(text.substring(0, 50))) {
+                            combinedPassage += text + "\n\n";
+                        }
+                    }
+                });
+            });
+            return combinedPassage.trim();
+        },
+
+        imageToBase64: async (url) => {
+            try {
+                const response = await fetch(url);
+                const blob = await response.blob();
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                });
+            } catch (e) {
+                // Fallback using Canvas
+                return new Promise((resolve) => {
+                    const img = new Image();
+                    img.crossOrigin = 'Anonymous';
+                    img.onload = () => {
+                        try {
+                            const canvas = document.createElement('canvas');
+                            canvas.width = img.width;
+                            canvas.height = img.height;
+                            const ctx = canvas.getContext('2d');
+                            ctx.drawImage(img, 0, 0);
+                            resolve(canvas.toDataURL('image/jpeg'));
+                        } catch (err) {
+                            resolve(null);
+                        }
+                    };
+                    img.onerror = () => resolve(null);
+                    img.src = url;
+                });
+            }
+        },
+
+        getRealImages: (images) => {
+            if (!images || images.length === 0) return [];
+            return images.filter(img => {
+                const src = (img.src || '').toLowerCase();
+                const aria = (img.aria || '').toLowerCase();
+                const title = (img.title || '').toLowerCase();
+
+                // 1. Exclude generic dropdown fields and interactive option wrappers
+                if (img.type === 'desc' && (aria.includes('dropdown') || aria.includes('choose an option') || aria.includes('select'))) {
+                    return false;
+                }
+                // 2. Exclude non-academic UI utilities (audio players, transcription indicators, volume toggles)
+                if (src.includes('transcript_icon') || src.includes('audio') || src.includes('volume') || src.includes('mute') || src.includes('icon')) {
+                    return false;
+                }
+                if (aria.includes('transcript') || aria.includes('audio player') || title.includes('audio')) {
+                    return false;
+                }
+                // 3. Exclude microscopic layout spacing elements
+                if (img.width > 0 && img.width < 10 && img.height > 0 && img.height < 10) {
+                    return false;
+                }
+
+                // Keep verified visual educational assets (illustrations, background files, canvas, diagrams)
+                return img.type === 'img' || img.type === 'bg' || img.type === 'canvas' || img.type === 'svg';
+            });
+        },
+
         cleanText: (str) => {
             return (str || '').replace(/\s+/g, ' ').trim();
         },
@@ -745,30 +1084,89 @@ const body = {
             if (!el) return '';
             const clone = el.cloneNode(true);
             clone.querySelectorAll('.sr-only, [hidden], [aria-hidden="true"], script, style').forEach(e => e.remove());
-            let text = clone.innerText;
-            if (!text || text.trim() === '') text = clone.textContent;
+
+            const blockTags = ['p', 'div', 'br', 'tr', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'mjx-container'];
+            blockTags.forEach(tag => {
+                clone.querySelectorAll(tag).forEach(node => {
+                    const spaceBefore = node.ownerDocument.createTextNode(' \n ');
+                    node.parentNode.insertBefore(spaceBefore, node);
+                    const spaceAfter = node.ownerDocument.createTextNode(' \n ');
+                    node.parentNode.insertBefore(spaceAfter, node.nextSibling);
+                });
+            });
+
+            let text = clone.innerText || clone.textContent || '';
             return Ed.Parsers.cleanText(text);
         },
 
-        getChoiceText: (el) => {
-            const readable = el.querySelector('.mathjax-readable');
-            if (readable) {
-                const text = Ed.Parsers.cleanText(readable.textContent);
-                if (text) return Ed.Parsers.normalizeMathText(text);
-            }
-            const mjx = el.querySelector('mjx-container');
-            if (mjx) {
-                const aria = mjx.getAttribute('aria-label');
-                if (aria) return Ed.Parsers.normalizeMathText(aria);
-            }
-            const content = el.querySelector('[data-ed-element="content"]');
-            if (content) {
-                const text = Ed.Parsers.getVisibleText(content);
-                if (text) return Ed.Parsers.normalizeMathText(text);
-            }
-            return Ed.Parsers.normalizeMathText(Ed.Parsers.getVisibleText(el));
-        },
+getChoiceText: (el) => {
+            if (!el) return '';
 
+            const clone = el.cloneNode(true);
+
+            clone.querySelectorAll('script[type^="math/"]').forEach(script => {
+                const text = Ed.Parsers.cleanText(script.textContent);
+                const span = script.ownerDocument.createElement('span');
+                span.textContent = ` $${text}$ `;
+                script.replaceWith(span);
+            });
+
+            clone.querySelectorAll('math').forEach(math => {
+                const latex = Ed.Parsers.toLaTeX(math);
+                const span = math.ownerDocument.createElement('span');
+                span.textContent = ` ${latex} `;
+                math.replaceWith(span);
+            });
+
+            clone.querySelectorAll('mjx-container').forEach(mjx => {
+                const mathml = mjx.getAttribute('data-mathml') || mjx.getAttribute('math');
+                let mathText = '';
+                if (mathml) {
+                    mathText = Ed.Parsers.cleanText(mathml);
+                } else {
+                    const aria = mjx.getAttribute('aria-label');
+                    if (aria) {
+                        mathText = Ed.Parsers.normalizeMathText(aria);
+                    }
+                }
+                const span = mjx.ownerDocument.createElement('span');
+                span.textContent = mathText ? ` ${mathText} ` : '';
+                mjx.replaceWith(span);
+            });
+
+            clone.querySelectorAll('.mathjax-readable').forEach(readable => {
+                const text = Ed.Parsers.cleanText(readable.textContent);
+                if (text) {
+                    const span = readable.ownerDocument.createElement('span');
+                    span.textContent = ` ${Ed.Parsers.normalizeMathText(text)} `;
+                    readable.replaceWith(span);
+                }
+            });
+
+            clone.querySelectorAll('.sr-only, [hidden], [aria-hidden="true"], script, style').forEach(e => e.remove());
+
+            const blockTags = ['p', 'div', 'br', 'tr', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'mjx-container'];
+            blockTags.forEach(tag => {
+                clone.querySelectorAll(tag).forEach(node => {
+                    const spaceBefore = node.ownerDocument.createTextNode(' \n ');
+                    node.parentNode.insertBefore(spaceBefore, node);
+                    const spaceAfter = node.ownerDocument.createTextNode(' \n ');
+                    node.parentNode.insertBefore(spaceAfter, node.nextSibling);
+                });
+            });
+
+            const img = clone.querySelector('img');
+            let imgDesc = '';
+            if (img) {
+                const alt = img.getAttribute('alt') || img.getAttribute('aria-label') || '';
+                const src = img.getAttribute('src') || '';
+                const file = src.split('/').pop().split('?')[0] || '';
+                imgDesc = alt ? ` [Image: ${alt}]` : (file ? ` [Image: ${file}]` : '');
+            }
+
+            let text = clone.innerText || clone.textContent || '';
+            return Ed.Parsers.normalizeMathText(Ed.Parsers.cleanText(text)) + imgDesc;
+        },
         findQuestionContainer: (widget, doc) => {
             let el = widget;
             while (el && el !== doc.body) {
@@ -790,12 +1188,8 @@ const body = {
             // Retrieve topic or module context to prime the AI
             const topic = Ed.Parsers.getTopicContext(doc);
 
-            // Search the entire document for reading passages or poems
-            let passage = '';
-            const passageEl = doc.querySelector('.passage, .reading-passage, [class*="passage"]');
-            if (passageEl) {
-                passage = Ed.Parsers.getVisibleText(passageEl);
-            }
+            // Search the entire document across all frames for reading passages or poems
+            let passage = Ed.Parsers.findGlobalReadingContext();
 
             let fullText = '';
             if (topic) {
@@ -893,8 +1287,43 @@ const body = {
 
             container.querySelectorAll('svg').forEach(svg => {
                 const aria = svg.getAttribute('aria-label') || '';
-                const svgText = Array.from(svg.querySelectorAll('text, tspan')).map(t => t.textContent).join(' ');
-                const context = Ed.Parsers.cleanText(svgText).substring(0, 500);
+
+                // Spatial SVG Reconstruction Algorithm
+                const spatialElements = [];
+
+                svg.querySelectorAll('line').forEach(l => {
+                    const x1 = parseFloat(l.getAttribute('x1') || 0);
+                    const y1 = parseFloat(l.getAttribute('y1') || 0);
+                    const x2 = parseFloat(l.getAttribute('x2') || 0);
+                    const y2 = parseFloat(l.getAttribute('y2') || 0);
+                    spatialElements.push({ type: 'Line', value: `from (${x1},${y1}) to (${x2},${y2})`, x: x1, y: y1 });
+                });
+
+                svg.querySelectorAll('circle, rect, polygon, ellipse, path').forEach(shape => {
+                    const tag = shape.tagName.toLowerCase();
+                    const x = parseFloat(shape.getAttribute('cx') || shape.getAttribute('x') || 0);
+                    const y = parseFloat(shape.getAttribute('cy') || shape.getAttribute('y') || 0);
+                    let shapeType = 'Shape';
+                    if (tag === 'polygon' || tag === 'path') shapeType = 'Polygon/Path';
+                    else if (tag === 'rect') shapeType = 'Rectangle';
+                    else if (tag === 'circle') shapeType = 'Circle';
+                    spatialElements.push({ type: shapeType, value: `at position (${x},${y})`, x, y });
+                });
+
+                const texts = svg.querySelectorAll('text, tspan');
+                texts.forEach(t => {
+                    const txt = Ed.Parsers.cleanText(t.textContent);
+                    if (!txt) return;
+                    const x = parseFloat(t.getAttribute('x') || t.getAttribute('dx') || 0);
+                    const y = parseFloat(t.getAttribute('y') || t.getAttribute('dy') || 0);
+                    spatialElements.push({ type: 'Label', value: `"${txt}"`, x, y });
+                });
+
+                // Sort everything spatially (top-to-bottom, left-to-right) so text LLMs can read coordinate layouts
+                spatialElements.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+                const spatialData = spatialElements.map(el => `[${el.type}] ${el.value} at coord (${Math.round(el.x)}, ${Math.round(el.y)})`);
+
+                const context = Ed.Parsers.cleanText(spatialData.join(' | ')).substring(0, 1000);
                 const rect = svg.getBoundingClientRect();
                 images.push({
                     type: 'svg',
@@ -909,7 +1338,6 @@ const body = {
                     height: Math.round(rect.height) || svg.clientHeight || 0
                 });
             });
-
             container.querySelectorAll('canvas').forEach(canvas => {
                 const rect = canvas.getBoundingClientRect();
                 images.push({
@@ -987,8 +1415,9 @@ const body = {
                 if (img.filenameHint) parts.push('Filename hint: "' + img.filenameHint + '"');
                 if (img.src) parts.push('URL: ' + img.src);
                 if (img.className) parts.push('CSS classes: ' + img.className);
+                if (img.ocrText) parts.push('OCR Extracted Text: "' + img.ocrText + '"');
 
-                if (!img.alt && !img.aria && !img.title && !img.context && !img.filenameHint && !img.src) {
+                if (!img.alt && !img.aria && !img.title && !img.context && !img.filenameHint && !img.src && !img.ocrText) {
                     parts.push('No textual clues available. Use the question text and standard mathematical/geometric principles to infer the diagram content.');
                 }
 
@@ -1011,13 +1440,13 @@ const body = {
             if (!data) return '';
             const base = (data.question || '').trim();
             if (data.type === 'mcq') {
-                return 'mcq:' + base + '|' + data.choices.map(c => (c.text || '').trim()).join('|');
+                return 'mcq:' + base + '|' + data.choices.map(c => (c.text || '').trim()).sort().join('|');
             }
             if (data.type === 'multiresponse') {
-                return 'mr:' + base + '|' + data.choices.map(c => (c.text || '').trim()).join('|');
+                return 'mr:' + base + '|' + data.choices.map(c => (c.text || '').trim()).sort().join('|');
             }
             if (data.type === 'hottext') {
-                return 'hottext:' + base + '|' + data.choices.map(c => (c.text || '').trim()).join('|');
+                return 'hottext:' + base + '|' + data.choices.map(c => (c.text || '').trim()).sort().join('|');
             }
             if (data.type === 'ggm') {
                 return 'ggm:' + base + '|' +
@@ -1433,7 +1862,6 @@ const body = {
                         };
                     });
 
-                    const paragraph = contentBlock.querySelector('p');
                     let template = '';
                     let menuIdx = 0;
 
@@ -1443,6 +1871,9 @@ const body = {
                         } else if (node.nodeType === Node.ELEMENT_NODE) {
                             const tag = node.tagName.toLowerCase();
                             if (tag === 'script' || tag === 'style') return;
+                            if (tag === 'span' && (node.getAttribute('style') || '').includes('width:0')) return;
+                            if (node.classList && node.classList.contains('mathjax-readable')) return;
+
                             if (tag === 'select' && node.classList.contains('inlinechoice-select')) {
                                 menuIdx++;
                                 template += ` {${menuIdx}} `;
@@ -1455,9 +1886,7 @@ const body = {
                         }
                     }
 
-                    if (paragraph) {
-                        Array.from(paragraph.childNodes).forEach(walkInline);
-                    }
+                    Array.from(contentBlock.childNodes).forEach(walkInline);
                     template = Ed.Parsers.normalizeMathText(template.replace(/\s+/g, ' ').trim());
 
                     const images = Ed.Parsers.getImageInfo(widget, d);
@@ -1504,28 +1933,29 @@ const body = {
         },
 
         buildPrompt: (data) => {
+            const globalDirectives = `[CRITICAL DIRECTIVE: You MUST be extremely concise while maintaining absolute academic accuracy. Keep your logic explanations very short and construct your response in strict JSON format.]\n\n`;
+
             let wrongFeedback = '';
             if (data.previousWrong) {
-                wrongFeedback = `CRITICAL: You already answered this question and got it WRONG. Your previous incorrect answer was: "${data.previousWrong}".\nYou are FORBIDDEN from giving the same answer again. You MUST choose a COMPLETELY DIFFERENT answer. Do not repeat "${data.previousWrong}" under any circumstances.\n\n`;
+                wrongFeedback = `CRITICAL: You already answered this question and got it WRONG. Your previous incorrect answer was: "${data.previousWrong}".\nYou are FORBIDDEN from giving the same answer again. You MUST choose a COMPLETELY DIFFERENT answer. Do not repeat "${data.previousWrong}" inside your JSON "answer" key under any circumstances.\n\n`;
             }
 
-            const imgSection = Ed.Parsers.formatImageInfo(data.images);
+            // Exclude interface/layout components to avoid empty or redundant diagram warnings
+            const realImages = Ed.Parsers.getRealImages(data.images);
+            const imgSection = Ed.Parsers.formatImageInfo(realImages);
             let strictSuffix = '';
             if (data._strictRetry) {
-                strictSuffix = `\n\nCRITICAL: Your previous response contained extra text, formatting, or explanation and could not be parsed. This time output ONLY the raw answer with no labels, no markdown, no sentences, and no punctuation around it. Just the answer exactly as requested.`;
+                strictSuffix = `\n\nCRITICAL: Your previous response could not be parsed as a valid JSON payload. This time, ensure you structure the output strictly inside the "answer" and "reasoning" JSON object properties.`;
             }
 
-            // Injected instruction to force short reasoning on cutoff recovery
             let shortSuffix = '';
-            if (data._shortRetry) {
-                shortSuffix = `\n\nCRITICAL WARNING: Your previous response was cut off because your reasoning was too long. Do not write a long reasoning block this time. Limit your [REASONING] section to a maximum of 2 sentences and write the [FINAL ANSWER] immediately.`;
+            if (Ed.State.shortRetry) {
+                shortSuffix = `\n\nCRITICAL WARNING: Your previous response was cut off because your reasoning was too long. Limit your "reasoning" block in the JSON response to a maximum of 2 sentences.`;
             }
 
-            // Combined suffixes to keep prompt code clean
             const suffix = strictSuffix + shortSuffix;
-
             if (data.type === 'mcq') {
-                let prompt = wrongFeedback + `You are REQUIRED to solve this multiple-choice question. Select the correct choice.\n\nQuestion:\n${data.question}${imgSection}\n\nChoices:\n`;
+                let prompt = globalDirectives + wrongFeedback + `You are REQUIRED to solve this multiple-choice question. Select the correct choice.\n\nQuestion:\n${data.question}${imgSection}\n\nChoices:\n`;
                 data.choices.forEach(c => {
                     prompt += `${c.letter}) ${c.text}\n`;
                 });
@@ -1533,7 +1963,7 @@ const body = {
                 return prompt;
             }
             if (data.type === 'multiresponse') {
-                let prompt = wrongFeedback + `You are REQUIRED to solve this multiple-response question. Select ALL options that apply.\n\nQuestion:\n${data.question}${imgSection}\n\nChoices:\n`;
+                let prompt = globalDirectives + wrongFeedback + `You are REQUIRED to solve this multiple-response question. Select ALL options that apply.\n\nQuestion:\n${data.question}${imgSection}\n\nChoices:\n`;
                 data.choices.forEach(c => {
                     prompt += `${c.letter}) ${c.text}\n`;
                 });
@@ -1541,7 +1971,7 @@ const body = {
                 return prompt;
             }
             if (data.type === 'hottext') {
-                let prompt = wrongFeedback + `You are REQUIRED to solve this text-selection question. Select the correct phrase(s) from the options.\n\nQuestion:\n${data.question}${imgSection}\n\nOptions:\n`;
+                let prompt = globalDirectives + wrongFeedback + `You are REQUIRED to solve this text-selection question. Select the correct phrase(s) from the options.\n\nQuestion:\n${data.question}${imgSection}\n\nOptions:\n`;
                 data.choices.forEach(c => {
                     prompt += `${c.letter}) ${c.text}\n`;
                 });
@@ -1549,7 +1979,7 @@ const body = {
                 return prompt;
             }
       if (data.type === 'ggm') {
-       let prompt = wrongFeedback + `You are answering a drag-and-drop categorization question.
+       let prompt = globalDirectives + wrongFeedback + `You are answering a drag-and-drop categorization question.
 Question:
 ${data.question}${imgSection}
 `;
@@ -1588,6 +2018,7 @@ Do not include any reasoning, explanations, or extra text.` + strictSuffix;
                     prompt += `${i + 1}. ${z.label}\n`;
                 });
                 prompt += `\nTell me which tile text belongs in each drop zone. You must form logical pairs in each row based on the question (e.g., matching dimensions to area).\n`;
+                prompt += `\n[CRITICAL NOTE: Both the Left Box and Right Box of each row are empty drop zones. The specific order in which you assign your matched pairs to Row r0, Row r1, Row r2, and Row r3 does not matter. Any arbitrary row order is correct as long as the Left and Right tiles in each individual row form a mathematically correct pair. Do not waste tokens trying to order the rows!]\n\n`;
                 prompt += `Respond with ONLY the tile TEXT VALUES, separated by commas, in the same order as the drop zones above (Row r0 Left Box, Row r0 Right Box, etc.).\n`;
                 prompt += `Do not include any reasoning, explanations, or extra text.\n`;
                 return prompt + strictSuffix;
@@ -1828,6 +2259,61 @@ ${data.question}${imgSection}
 
     return mapping;
 },
+
+        parseMPSimpleAnswer: (text, data) => {
+            const cleaned = Ed.AI.cleanAIResponse(text);
+            const mapping = {};
+            const usedTiles = new Set();
+
+            const parts = cleaned.split(/[,;\n]/).map(p => p.trim()).filter(Boolean);
+            let zoneIdx = 0;
+
+            for (const part of parts) {
+                if (zoneIdx >= data.droppables.length) break;
+
+                const normVal = part.toLowerCase()
+                    .replace(/startroot/g, '√')
+                    .replace(/endroot/g, '')
+                    .replace(/sqrt/g, '√')
+                    .replace(/\s+/g, '');
+
+                let bestTile = null;
+
+                bestTile = data.draggables.find(t => !usedTiles.has(t.id) && t.text === part);
+
+                if (!bestTile) {
+                    bestTile = data.draggables.find(t => {
+                        if (usedTiles.has(t.id)) return false;
+                        const normTile = t.text.toLowerCase()
+                            .replace(/startroot/g, '√')
+                            .replace(/endroot/g, '')
+                            .replace(/sqrt/g, '√')
+                            .replace(/\s+/g, '');
+                        return normTile === normVal;
+                    });
+                }
+
+                if (!bestTile) {
+                    bestTile = data.draggables.find(t => {
+                        if (usedTiles.has(t.id)) return false;
+                        const normTile = t.text.toLowerCase()
+                            .replace(/startroot/g, '√')
+                            .replace(/endroot/g, '')
+                            .replace(/sqrt/g, '√')
+                            .replace(/\s+/g, '');
+                        return normVal.includes(normTile) || normTile.includes(normVal);
+                    });
+                }
+
+                if (bestTile) {
+                    const dropId = data.droppables[zoneIdx].id;
+                    mapping[dropId] = bestTile.id;
+                    usedTiles.add(bestTile.id);
+                    zoneIdx++;
+                }
+            }
+            return mapping;
+        },
 
         parseMatchedPairsAnswer: (text, data) => {
             const cleaned = Ed.AI.cleanAIResponse(text);
@@ -2354,7 +2840,13 @@ ${data.question}${imgSection}
     // ========================================================================
     Ed.Answer = {
             isOkToExit: (d) => {
-        // STRICT: Use your exact progress HTML structure
+        // Safe worksheets override: If the "End Session" button is visible, the last worksheet question is solved.
+        const endSessionBtn = d.querySelector('.worksheets-endsession');
+        if (endSessionBtn && Ed.Utils.isVisible(endSessionBtn, d)) {
+            return true;
+        }
+
+        // STRICT: Use your exact progress HTML structure for standard tests
         const progressEl = d.querySelector('.progressSummaryItem h2.progressSummaryLabel-question span.progressSummary-question, .progressSummary-question, span.progressSummary-question');
         if (!progressEl) return false; // Not loaded yet = DO NOT EXIT
 
@@ -2375,9 +2867,15 @@ ${data.question}${imgSection}
         return true; // Only true if on last question AND submit button is hidden/gone
     },
         isEndOfTest: (d) => {
+        // Safe worksheets override: If the "End Session" button is visible, the last worksheet question is solved.
+        const endSessionBtn = d.querySelector('.worksheets-endsession');
+        if (endSessionBtn && Ed.Utils.isVisible(endSessionBtn, d)) {
+            return true;
+        }
+
         // Returns true if we are on the last question and it's answered, BUT NOT on the results screen yet.
-        // NOTE: #exit-session-btn is REMOVED because it exists in the header from Q1 and causes false negatives.
-        if (d.querySelector('#results-wrapper, .assessment-results, .test-results')) return false;
+        const resNode = d.querySelector('#results-wrapper, .assessment-results, .test-results, .mastery-test-results-content');
+        if (resNode && Ed.Utils.isVisible(resNode, d)) return false;
         const progressEl = d.querySelector('.progressSummaryItem h2.progressSummaryLabel-question span.progressSummary-question, .progressSummary-question, span.progressSummary-question');
         if (!progressEl) return false;
         const text = progressEl.textContent.trim();
@@ -2441,9 +2939,10 @@ clickSubmitOrNext: async (preferredDoc) => {
                 }
             }
 
-              if (foundBtn) {
+        if (foundBtn) {
         const doc = preferredDoc || document;
-        const isResultsScreen = !!doc.querySelector('#results-wrapper, .assessment-results, .test-results, #exit-session-btn');
+        const resNode = doc.querySelector('#results-wrapper, .assessment-results, .test-results, .mastery-test-results-content');
+        const isResultsScreen = resNode && Ed.Utils.isVisible(resNode, doc);
         const isLastQuestion = Ed.Answer.isEndOfTest(doc);
         const btnText = (foundBtn.textContent || foundBtn.innerText || '').toLowerCase().trim();
         const isFinalSubmitBtn = btnText.includes('submit test') || btnText.includes('end session') || btnText.includes('finish test') || foundBtn.matches('.worksheets-endsession, [aria-label*="Submit Test"]');
@@ -2498,23 +2997,23 @@ clickSubmitOrNext: async (preferredDoc) => {
                             okBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
                             okBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
                             okBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                            if (isSubmitDialog) { Ed.Answer.stopAnswer(); Ed.UI.showToast('Test submitted!', 3000); }
+                            if (isSubmitDialog) { Ed.Answer.stopAnswer(false); Ed.UI.showToast('Test submitted!', 3000); }
                             return true;
                         }
                     }
                 }
 
                 // 2. HARD GATE: DO NOT scan for exit buttons unless we are on the actual results screen OR the final question is answered.
-                // We explicitly IGNORE #exit-session-btn here because it exists in the header from Q1.
-                const isResultsScreen = !!d.querySelector('#results-wrapper, .assessment-results, .test-results');
+                const resNode = d.querySelector('#results-wrapper, .assessment-results, .test-results, .mastery-test-results-content');
+                const isResultsScreen = resNode && Ed.Utils.isVisible(resNode, d);
                 const isFinalQuestionAnswered = Ed.Answer.isOkToExit(d);
                 if (!isResultsScreen && !isFinalQuestionAnswered) continue;
 
-                // 3. Find exit buttons, but STRICTLY EXCLUDE header/nav buttons to prevent premature clicks
-                const allExitBtns = Array.from(d.querySelectorAll('button[aria-label="Save and Exit"], button.rbi-btn.floatright, #exit-session-btn > button'));
+                // 3. Find exit buttons, but STRICTLY EXCLUDE header/nav buttons to prevent premature clicks (unless the results wrapper is fully visible)
+                const allExitBtns = Array.from(d.querySelectorAll('button[aria-label="Save and Exit"], button[aria-label*="Save & Exit"], button[aria-label="Exit"], button.rbi-btn.floatright, #exit-session-btn > button'));
                 for (const btn of allExitBtns) {
-                    // CRITICAL: Skip if button is inside a header, nav, or top bar
-                    if (btn.closest('header, nav, .header-wrapper, .top-nav, .global-nav, .rbi-top-nav')) continue;
+                    // CRITICAL: Skip if button is inside a header, nav, or top bar - UNLESS we are 100% safely on the final results screen
+                    if (!isResultsScreen && btn.closest('header, nav, .header-wrapper, .top-nav, .global-nav, .rbi-top-nav')) continue;
                     if (!Ed.Utils.isClickable(btn, d)) continue;
 
                     Ed.UI.showToast('Assignment complete — closing...', 2000);
@@ -2638,10 +3137,46 @@ clickSubmitOrNext: async (preferredDoc) => {
             if (Ed.State.manuallyPausedSubmission) return;
             if (!Ed.State.answerRunning) return;
 
+            // Global Question State Sync to preserve retry and truncation state across rate limit interruptions
+            const activeData = Ed.Parsers.extractHottext() || Ed.Parsers.extractMCQ() || Ed.Parsers.extractMultipleResponse() || Ed.Parsers.extractMatchedPairsSimple() || Ed.Parsers.extractGGM() || Ed.Parsers.extractMatchedPairs() || Ed.Parsers.extractTextEntry() || Ed.Parsers.extractSeqResponse() || Ed.Parsers.extractInlineChoice() || Ed.Parsers.extractHotspot();
+            if (activeData) {
+                const sig = Ed.Parsers.getQuestionSignature(activeData);
+                if (sig !== Ed.State.lastQuestionSignature) {
+                    Ed.State.lastQuestionSignature = sig;
+                    Ed.State.lastAnswerWasWrong = false;
+                    Ed.State.lastAnswerRaw = null;
+                    Ed.State.questionRetryCount = 0;
+                    Ed.State.hasConfirmedSubmission = false;
+                    Ed.State.shortRetry = false;
+                    Ed.State.shortRetryCount = 0;
+                    Ed.State.forceNoReasoning = false;
+                    Ed.State.extendedTokens = false;
+                }
+            }
+
             // 1. Check Dialogs
             if (await Ed.Answer.handleSaveExitDialog()) return;
+            // 1.5 Mastery Test Results Native Override
+            for (const d of Ed.Utils.getDocs()) {
+                const resultsWrapper = d.querySelector('.non-item-content .mastery-test-results-content');
+                const exitBtn = d.querySelector('button.mastery-test-exit');
+                if (resultsWrapper && exitBtn && Ed.Utils.isVisible(exitBtn, d)) {
+                    const activePrompt = d.querySelector('.prompt, .stem');
+                    // Extremely strict check: Ensure we are truly on the end screen and NOT looking at an active question
+                    if (!activePrompt || !Ed.Utils.isVisible(activePrompt, d)) {
+                        const btnText = (exitBtn.textContent || '').toLowerCase();
+                        if (btnText.includes('close and return')) {
+                            Ed.UI.showToast('Mastery test complete — returning to activities...', 3000);
+                            exitBtn.click();
+                            Ed.Answer.stopAnswer(false);
+                            await Ed.Utils.delayAsync(1500);
+                            return;
+                        }
+                    }
+                }
+            }
 
-            // 2. Check Retry
+           // 2. Check Retry
             if (Ed.Answer.clickRetry()) {
                 Ed.State.lastAnswerWasWrong = true;
                 Ed.State.questionRetryCount++;
@@ -2652,19 +3187,23 @@ clickSubmitOrNext: async (preferredDoc) => {
                 return;
             }
 
-                        // 3. Check for Final Results Screen & Exit Buttons
+            // 3. Check for Final Results Screen & Exit Buttons
             for (const d of Ed.Utils.getDocs()) {
+                const resNode = d.querySelector('#results-wrapper, .assessment-results, .test-results, .mastery-test-results-content');
+                const isResultsScreen = resNode && Ed.Utils.isVisible(resNode, d);
+
                 const returnBtns = Array.from(d.querySelectorAll('button, a'));
                 for (const btn of returnBtns) {
-                    // CRITICAL: Ignore buttons inside headers/navs to prevent premature exit clicks
-                    if (btn.closest('header, nav, .header-wrapper, .top-nav, .global-nav, .rbi-top-nav')) continue;
+                    // CRITICAL: Ignore buttons inside headers/navs to prevent premature exit clicks, UNLESS on the safe results screen
+                    if (!isResultsScreen && btn.closest('header, nav, .header-wrapper, .top-nav, .global-nav, .rbi-top-nav')) continue;
                     const text = (btn.textContent || btn.innerText || '').toLowerCase().trim();
-                    // Extremely strict text matching to prevent accidental clicks on the intro screen
+
                     const isExitBtn = text.includes('close and return') ||
-                    text.includes('return to activities');
+                                      text.includes('return to activities') ||
+                                      (isResultsScreen && (text.includes('save and exit') || text === 'exit'));
+
                     if (isExitBtn) {
                         // STRICT: Only click if we are on the last question and it's answered, or results screen is present
-                        const isResultsScreen = !!d.querySelector('.assessment-results, .test-results');
                         if (!isResultsScreen && !Ed.Answer.isOkToExit(d)) continue;
                         // Ensure button is actually visible/clickable on the screen
                         if (btn.offsetWidth > 0 || Ed.Utils.isVisible(btn, d)) {
@@ -2678,7 +3217,7 @@ clickSubmitOrNext: async (preferredDoc) => {
                             btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
                             btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
 
-                            Ed.Answer.stopAnswer();
+                            Ed.Answer.stopAnswer(false);
                             await Ed.Utils.delayAsync(1500);
                             return;
                         }
@@ -2883,7 +3422,7 @@ clickSubmitOrNext: async (preferredDoc) => {
                 return;
             }
 
-            // ===== MatchedPairsSimple =====
+// ===== MatchedPairsSimple =====
             data = Ed.Parsers.extractMatchedPairsSimple();
             if (data) {
                 foundQuestion = true;
@@ -2914,7 +3453,7 @@ clickSubmitOrNext: async (preferredDoc) => {
 
                 let mapping;
                 try {
-                    const { result, parsed } = await Ed.AI.fetchAIAnswer(data, (text) => Ed.Parsers.parseGGMAnswer(text, data));
+                    const { result, parsed } = await Ed.AI.fetchAIAnswer(data, (text) => Ed.Parsers.parseMPSimpleAnswer(text, data));
                     mapping = parsed;
                     Ed.State.lastAnswerRaw = result.answer;
                 } catch (e) {
@@ -3348,10 +3887,12 @@ clickSubmitOrNext: async (preferredDoc) => {
             }
         },
 
-        stopAnswer: () => {
+        stopAnswer: (permanently = false) => {
             Ed.State.answerRunning = false;
-            Ed.Config.set('AUTO_ANSWER_ENABLED', false);
-            Ed.UI.updateToggle('AUTO_ANSWER_ENABLED', false);
+            if (permanently) {
+                Ed.Config.set('AUTO_ANSWER_ENABLED', false);
+                Ed.UI.updateToggle('AUTO_ANSWER_ENABLED', false);
+            }
             if (Ed.State.answerIv) { clearInterval(Ed.State.answerIv); Ed.State.answerIv = null; }
             Ed.State.answerBusy = false;
             Ed.UI.stopCountdownToast();
@@ -3970,7 +4511,7 @@ clickSubmitOrNext: async (preferredDoc) => {
             style.id = 'ed-global-modal-styles';
             style.textContent = `
                 #ed-setup-modal, #ed-recom-modal, #ed-notif-modal, #ed-confirm-modal, #ed-bg-alert-modal, #ed-applied-modal, #ed-invalid-key-modal { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.8); backdrop-filter: blur(10px); display: flex; justify-content: center; align-items: center; z-index: 100000000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-                .modal-box { background: #0f172a; width: 480px; padding: 35px; border-radius: 24px; box-shadow: 0 30px 80px rgba(0,0,0,0.8); border: 1px solid rgba(255,255,255,0.05); transform: translateY(20px); opacity: 0; animation: slideUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+                .modal-box { background: #0f172a; width: 500px; padding: 35px; border-radius: 24px; box-shadow: 0 30px 80px rgba(0,0,0,0.8); border: 1px solid rgba(255,255,255,0.05); transform: translateY(20px); opacity: 0; animation: slideUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
                 @keyframes slideUp { to { transform: translateY(0); opacity: 1; } }
                 @keyframes slideDown { to { transform: translateY(20px); opacity: 0; } }
                 @keyframes fadeOut { to { opacity: 0; } }
@@ -4003,7 +4544,7 @@ clickSubmitOrNext: async (preferredDoc) => {
             document.head.appendChild(style);
         },
 
-        showToast: (text, duration = 2500) => {
+showToast: (text, duration = 2500) => {
             Ed.State.lastActivityTime = Date.now();
             if (!Ed.Config.get("TOAST_ENABLED", true) || !document.body) return;
             if (!Ed.UI.toastStylesInjected) {
@@ -4013,18 +4554,45 @@ clickSubmitOrNext: async (preferredDoc) => {
                     #ed-toast { position: fixed; bottom: -60px; left: 50%; transform: translateX(-50%); background: rgba(15, 23, 42, 0.95); color: #fff; padding: 10px 20px; border-radius: 30px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; display: flex; align-items: center; gap: 10px; z-index: 99999999; box-shadow: 0 8px 32px rgba(0,0,0,0.4); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); opacity: 0; transition: bottom 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275), opacity 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); pointer-events: none; white-space: nowrap; max-width: 90vw; }
                     #ed-toast.show { bottom: 25px; opacity: 1; }
                     .ed-toast-icon { background: linear-gradient(135deg, #10b981, #3b82f6); color: white; width: 22px; height: 22px; border-radius: 50%; display: flex; justify-content: center; align-items: center; font-weight: bold; font-size: 12px; flex-shrink: 0; box-shadow: 0 2px 8px rgba(16, 185, 129, 0.4); }
+                    @keyframes ed-dots {
+                        0% { content: ""; }
+                        25% { content: "."; }
+                        50% { content: ".."; }
+                        75% { content: "..."; }
+                    }
+                    .ed-loading::after {
+                        content: "";
+                        animation: ed-dots 1.6s steps(4, end) infinite;
+                        display: inline-block;
+                        width: 15px;
+                        text-align: left;
+                    }
                 `;
                 (document.head || document.documentElement).appendChild(style);
             }
             let toast = document.getElementById('ed-toast');
             if (!toast) { toast = document.createElement('div'); toast.id = 'ed-toast'; document.body.appendChild(toast); }
             toast.innerHTML = `<div class="ed-toast-icon">E</div>`;
-            const span = document.createElement('span'); span.textContent = text; toast.appendChild(span);
+            const span = document.createElement('span');
+            if (text.endsWith('...')) {
+                span.textContent = text.slice(0, -3);
+                span.classList.add('ed-loading');
+            } else {
+                span.textContent = text;
+                span.classList.remove('ed-loading');
+            }
+            toast.appendChild(span);
             toast.offsetHeight; toast.classList.add('show');
             if (toast.timeoutId) clearTimeout(toast.timeoutId);
-            toast.timeoutId = setTimeout(() => toast.classList.remove('show'), duration);
+            if (duration > 0) {
+                toast.timeoutId = setTimeout(() => toast.classList.remove('show'), duration);
+            }
         },
 
+        hideToast: () => {
+            const toast = document.getElementById('ed-toast');
+            if (toast) toast.classList.remove('show');
+        },
         startCountdownToast: (baseText, seconds) => {
             Ed.State.lastActivityTime = Date.now();
             Ed.UI.stopCountdownToast();
@@ -4070,10 +4638,12 @@ clickSubmitOrNext: async (preferredDoc) => {
                 overlay.setAttribute('role', 'dialog');
                 overlay.setAttribute('aria-modal', 'true');
                 overlay.innerHTML = `
-                    <div class="modal-box">
+                    <div class="modal-box" style="width: 500px;">
                         <div class="modal-title"><span>E</span> Edmentum Solver Setup</div>
                         <div class="modal-desc">
-                        <strong style="color:#f8fafc;">Cerebras:</strong> Go to <a href="https://www.cerebras.ai/ " target="_blank" style="color:#10b981; text-decoration:none;">cerebras.ai</a>, login until you see your API key. Pick the <strong>free subscription</strong>. Copy and input it below.<br><br>
+                            <strong style="color:#f8fafc;">1. Cerebras Key (Required):</strong> Go to <a href="https://cloud.cerebras.ai" target="_blank" style="color:#10b981; text-decoration:none;">cloud.cerebras.ai</a>, log in until you see your API key, copy and input it below. Cerebras is required for the core text solving features of this script to function.<br><br>
+                            <strong style="color:#f8fafc;">2. Groq Key (Highly Recommended):</strong> Go to <a href="https://console.groq.com/keys" target="_blank" style="color:#10b981; text-decoration:none;">console.groq.com/keys</a>, log in, click "Create API Key", name it "Edmentum Vision", set no expiration, and copy it here.
+                            <em style="color:#94a3b8; display:block; margin-top:4px;">Without a Groq key, the script cannot analyze images, and accuracy on diagram-based questions will drop significantly!</em>
                         </div>
                         <div class="input-group">
                             <label>Cerebras API Key</label>
@@ -4081,50 +4651,83 @@ clickSubmitOrNext: async (preferredDoc) => {
                             <div class="key-error" id="cerebras-key-error">❌ Invalid API Key</div>
                             <div class="key-validating" id="cerebras-key-validating">⏳ Validating...</div>
                         </div>
+                        <div class="input-group">
+                            <label>Groq API Key (Vision Fallback)</label>
+                            <input type="password" id="ed-groq-key" placeholder="gsk_...">
+                            <div class="key-error" id="groq-key-error">❌ Invalid API Key</div>
+                            <div class="key-validating" id="groq-key-validating">⏳ Validating...</div>
+                        </div>
                         <button class="save-btn" id="ed-save-keys">Save & Continue</button>
                     </div>`;
                 document.body.appendChild(overlay);
                 overlay.querySelector('#ed-cerebras-key').value = Ed.Config.safeGetKey("cerebras_key");
+                overlay.querySelector('#ed-groq-key').value = Ed.Config.safeGetKey("groq_key");
 
                 const btn = document.getElementById('ed-save-keys');
                 btn.focus();
 
                 btn.addEventListener('click', async () => {
                     const ck = overlay.querySelector('#ed-cerebras-key').value.trim();
+                    const gk = overlay.querySelector('#ed-groq-key').value.trim();
 
                     if (!ck) { alert("Please provide your Cerebras API key."); return; }
 
                     btn.disabled = true;
-                    btn.textContent = "Validating...";
+                    btn.textContent = "Validating Keys...";
 
                     let cerebrasValid = true;
+                    let groqValid = true;
 
                     const cerebrasError = overlay.querySelector('#cerebras-key-error');
                     const cerebrasValidating = overlay.querySelector('#cerebras-key-validating');
                     cerebrasError.classList.remove('show');
                     cerebrasValidating.classList.add('show');
 
-                    const result = await Ed.AI.validateKey('cerebras', ck);
+                    const resultCerebras = await Ed.AI.validateKey('cerebras', ck);
                     cerebrasValidating.classList.remove('show');
 
-                    if (result.valid === false) {
+                    if (resultCerebras.valid === false) {
                         cerebrasValid = false;
-                        cerebrasError.textContent = `❌ ${result.error}`;
+                        cerebrasError.textContent = `❌ ${resultCerebras.error}`;
                         cerebrasError.classList.add('show');
-                    } else if (result.valid === null) {
+                    } else if (resultCerebras.valid === null) {
                         cerebrasError.textContent = `⚠️ Could not verify (network error). Key will be saved anyway.`;
                         cerebrasError.style.color = '#f59e0b';
                         cerebrasError.classList.add('show');
                     }
 
-                    if (!cerebrasValid) {
+                    if (gk) {
+                        const groqError = overlay.querySelector('#groq-key-error');
+                        const groqValidating = overlay.querySelector('#groq-key-validating');
+                        groqError.classList.remove('show');
+                        groqValidating.classList.add('show');
+
+                        const resultGroq = await Ed.AI.validateGroqKey(gk);
+                        groqValidating.classList.remove('show');
+
+                        if (resultGroq.valid === false) {
+                            groqValid = false;
+                            groqError.textContent = `❌ ${resultGroq.error}`;
+                            groqError.classList.add('show');
+                        } else if (resultGroq.valid === null) {
+                            groqError.textContent = `⚠️ Could not verify (network error). Key will be saved anyway.`;
+                            groqError.style.color = '#f59e0b';
+                            groqError.classList.add('show');
+                        }
+                    }
+
+                    if (!cerebrasValid || !groqValid) {
                         btn.disabled = false;
                         btn.textContent = "Save & Continue";
-                        Ed.Notifications.showInvalidKeyModal("Cerebras", overlay.querySelector('#cerebras-key-error').textContent.replace('❌ ', ''));
                         return;
                     }
 
                     Ed.Config.set("cerebras_key", Ed.Config.encode(ck));
+                    if (gk) {
+                        Ed.Config.set("groq_key", Ed.Config.encode(gk));
+                    } else {
+                        Ed.Config.set("groq_key", "");
+                    }
                     Ed.UI.closeModalSmoothly(overlay, resolve);
                 });
             });
@@ -4304,7 +4907,7 @@ clickSubmitOrNext: async (preferredDoc) => {
             .icon-lg { width: 18px; height: 18px; }
 
             #panel { width: 380px; background: rgba(15, 23, 42, 0.98); border-radius: 24px; box-shadow: 0 20px 60px rgba(0,0,0,0.8); overflow: hidden; border: 1px solid rgba(255,255,255,0.08); backdrop-filter: blur(20px); user-select: none; transition: box-shadow 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
-            #panel.solving { box-shadow: 0 0 35px rgba(16, 185, 129, 0.4); border-color: rgba(16, 185, 129, 0.4); }
+            #panel.solving { }
             .header { padding: 18px 24px; display: flex; align-items: center; gap: 12px; cursor: move; background: rgba(30, 41, 59, 0.9); border-bottom: 1px solid rgba(255,255,255,0.05); }
             .logo { background: linear-gradient(135deg, #10b981, #3b82f6); width: 28px; height: 28px; display: flex; justify-content: center; align-items: center; border-radius: 8px; font-size: 16px; color: white; font-weight: 600; text-align: center; line-height: 28px; box-shadow: 0 4px 10px rgba(16, 185, 129, 0.3); }
             .title { color: #f8fafc; font-weight: 700; font-size: 15px; letter-spacing: -0.3px; flex: 1; }
@@ -4381,7 +4984,7 @@ clickSubmitOrNext: async (preferredDoc) => {
         const reasoningActive = Ed.Config.get("CEREBRAS_REASONING", true) ? 'active' : '';
 
         p.innerHTML = `
-            <div class="header"><div class="logo">E</div><div class="title">Edmentum Solver <span id="version-tag" style="font-size: 10px; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; margin-left: 8px; font-weight: 500;">v1.1.1</span></div><div class="header-btns"><button class="header-btn" id="collapse-btn">—</button><button class="header-btn" id="hide-btn">✕</button></div></div>
+            <div class="header"><div class="logo">E</div><div class="title">Edmentum Solver <span id="version-tag" style="font-size: 10px; background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; margin-left: 8px; font-weight: 500;">v1.2.0</span></div><div class="header-btns"><button class="header-btn" id="collapse-btn">—</button><button class="header-btn" id="hide-btn">✕</button></div></div>
             <div id="panel-body">
                <div class="tabs">
                     <div class="tab active" data-tab="features"><svg viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Features</div>
@@ -4392,7 +4995,7 @@ clickSubmitOrNext: async (preferredDoc) => {
                     <div class="content">
                         <div class="section-label">Core Automation</div>
                         <div class="row" data-key="AUTO_TUTORIAL_ENABLED">
-                            <div class="row-label"><div class="row-title">Auto Tutorial</div><div class="row-desc">Navigates through tutorial slides</div></div>
+                            <div class="row-label"><div class="row-title">Auto Tutorial</div><div class="row-desc">Automatically completes tutorials.</div></div>
                             <div class="row-controls"><input type="text" class="delay-input" data-delay="TUTORIAL_DELAY" value="${tutVal}"><span class="delay-unit">s</span><div class="toggle ${tutActive}"></div></div>
                         </div>
                         <div class="row" data-key="AUTO_ANSWER_ENABLED">
@@ -4423,7 +5026,7 @@ clickSubmitOrNext: async (preferredDoc) => {
                         <div class="section-divider"></div>
                         <div class="section-label">Notifications</div>
                         <div class="row" data-key="AUTO_NOTIFY">
-                            <div class="row-label"><div class="row-title">Desktop Notifications</div><div class="row-desc">Alerts you on completion or stuck failures</div></div>
+                            <div class="row-label"><div class="row-title">Desktop Notifications</div><div class="row-desc">Alerts you on completion.</div></div>
                             <div class="row-controls"><div class="toggle ${autoNotifActive}"></div></div>
                         </div>
                         <div class="row" data-key="TOAST_ENABLED">
@@ -4443,7 +5046,7 @@ clickSubmitOrNext: async (preferredDoc) => {
                     <div class="content">
                         <div class="section-label">API Keys (Manage Only)</div>
                         <div style="font-size: 12px; color: #94a3b8; margin-bottom: 15px; line-height: 1.5; padding: 10px; background: rgba(16, 185, 129, 0.1); border-radius: 10px; border: 1px solid rgba(16, 185, 129, 0.2);">
-                            Connect your Cerebras API provider to solve questions using Z.ai GLM 4.7.
+                            Connect your API providers. Cerebras processes primary text-based inputs. Groq operates multimodal vision models to pre-analyze visual contents.
                         </div>
 
                         <div class="api-card" data-provider="cerebras">
@@ -4463,6 +5066,23 @@ clickSubmitOrNext: async (preferredDoc) => {
                             <div class="api-status" id="api-cerebras-status"></div>
                         </div>
 
+                        <div class="api-card" data-provider="groq">
+                            <div class="api-card-header">
+                                <div class="api-card-title"><span style="color:#ef4444; font-weight: bold;">G</span> Groq (Vision Fallback)</div>
+                                <a href="https://console.groq.com/keys" target="_blank" class="api-link">Get Key ↗</a>
+                            </div>
+                            <div class="api-input-wrapper">
+                                <input type="password" class="api-key-input" id="api-groq-input" placeholder="gsk_...">
+                                <button class="api-action-btn api-toggle-vis" title="Show/Hide">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                                </button>
+                                <button class="api-action-btn api-delete-key" title="Delete">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2 2v2"></path></svg>
+                                </button>
+                            </div>
+                            <div class="api-status" id="api-groq-status"></div>
+                        </div>
+
                         <div class="section-divider"></div>
                         <div class="section-label">AI Settings</div>
                         <div class="row" data-key="CEREBRAS_REASONING">
@@ -4477,8 +5097,8 @@ clickSubmitOrNext: async (preferredDoc) => {
                     </div>
                 </div>
                 <div class="tab-content" id="tab-about"><div class="about-content">
-                    <div class="about-title">Edmentum Solver v1.1.1</div>
-                    <div style="margin-bottom: 10px;">Made by floor with AI.<br>Press <strong>Alt + H</strong> to hide UI (Shift+Alt+H for permanent hide).</div>
+                    <div class="about-title">Edmentum Solver v1.2.0</div>
+                    <div style="margin-bottom: 10px;">Made by Floor with AI.<br>Press <strong>Alt + H</strong> to hide UI (Shift+Alt+H for permanent hide).</div>
 
                     <div class="section-divider"></div>
                     <div class="about-title" style="font-size:14px; margin-bottom:8px;">FAQ</div>
@@ -4486,13 +5106,13 @@ clickSubmitOrNext: async (preferredDoc) => {
                     <div class="faq-a">The script can automate tests and tutorials, and be able to autoenter them and go to next lesson, it cannot do teacher graded activities.</div>
 
                     <div class="faq-q">Is the AI 100% perfect?</div>
-                    <div class="faq-a">No, the AI is not 100% perfect. You can turn on Confirm Before Submit option in the UI so you can check the AI's answers.</div>
+                    <div class="faq-a">No, the AI is not perfect. You can turn on Confirm Before Submit option in the UI so you can check the AI's answers.</div>
 
                     <div class="faq-q">How do range delays work?</div>
                     <div class="faq-a">Enter e.g. <code>25-35</code> to pick a random delay between 25s and 35s.</div>
 
                     <div class="faq-q">Why does the script randomly pause?</div>
-                    <div class="faq-a">It will pause if "Confirm Before Submit" is enabled or if rate limits (5 requests/min) are active. It automatically ticks down to continue.</div>
+                    <div class="faq-a">It will pause if "Confirm Before Submit" is enabled or if rate limits are active. It automatically ticks down to continue.</div>
 
                     <div class="faq-q">How do I get Desktop Notifications?</div>
                     <div class="faq-a">Enable Auto Notify and allow system permissions in your browser.</div>
@@ -4506,6 +5126,9 @@ clickSubmitOrNext: async (preferredDoc) => {
 
         const cerebrasInput = shadow.getElementById('api-cerebras-input');
         if (cerebrasInput) cerebrasInput.value = Ed.Config.safeGetKey("cerebras_key");
+
+        const groqInput = shadow.getElementById('api-groq-input');
+        if (groqInput) groqInput.value = Ed.Config.safeGetKey("groq_key");
 
         shadow.querySelectorAll('.api-card').forEach(row => {
             const input = row.querySelector('.api-key-input');
@@ -4534,7 +5157,9 @@ clickSubmitOrNext: async (preferredDoc) => {
                     statusEl.className = 'api-status validating';
                     statusEl.textContent = '⏳ Validating...';
 
-                    const result = await Ed.AI.validateKey(provider, val);
+                    const result = provider === 'cerebras'
+                        ? await Ed.AI.validateKey(provider, val)
+                        : await Ed.AI.validateGroqKey(val);
 
                     if (result.valid) {
                         statusEl.className = 'api-status success';
@@ -4597,7 +5222,7 @@ clickSubmitOrNext: async (preferredDoc) => {
 
                 if (key === "AUTO_ANSWER_ENABLED") {
                     if (isActive) Ed.Answer.startAnswer(false);
-                    else Ed.Answer.stopAnswer();
+                    else Ed.Answer.stopAnswer(true);
                 }
                 if (key === "AUTO_TUTORIAL_ENABLED") {
                     if (isActive) Ed.Tutorial.tryStartTutorial();
