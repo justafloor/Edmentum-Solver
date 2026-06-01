@@ -1,8 +1,8 @@
-# Edmentum Solver (v1.1.0)
+# Edmentum Solver (v1.2.0)
 
 Automate your Edmentum experience for free. An open-source userscript designed to automate the majority of tasks within the standard Edmentum platform, allowing for a much smoother experience.
 
-[![Greasy Fork](https://img.shields.io/badge/Install%20from-Greasy%20Fork-red?style=for-the-badge)](https://greasyfork.org/en/scripts/578793-edmentum-solver-v1-0-0)
+[![Greasy Fork](https://img.shields.io/badge/Install%20from-Greasy%20Fork-red?style=for-the-badge)](https://greasyfork.org/en/scripts/578793-edmentum-solver-v1-2-0)
 
 ---
 
@@ -12,8 +12,7 @@ Automate your Edmentum experience for free. An open-source userscript designed t
 * **Auto Tutorial:** Automatically navigates through tutorial slides with customizable delays. It skips near the end of tutorials and finishes them automatically.
 * **Auto-Activity & Advance:** Enters the next module and moves through the course automatically.
 * **Background Mode:** Includes an anti-throttle feature to keep the script running normally, even when offtab.
-> ❌ **Note:** This script CANNOT complete projects or teacher-graded activities, and may have trouble submitting (this will be fixed soon)
-
+> ❌ **Note:** This script CANNOT complete projects or teacher-graded activities!
 ---
 
 ## ⚠️ Compatibility Notice
