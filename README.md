@@ -1,4 +1,4 @@
-# Edmentum Solver (v1.3.0)
+# Edmentum Solver (v1.3.1)
 
 Automate your Edmentum experience for free. An open-source userscript designed to automate the majority of tasks within the standard Edmentum platform, allowing for a much smoother experience.
 
