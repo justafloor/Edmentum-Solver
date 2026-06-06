@@ -1,4 +1,4 @@
-# Edmentum Solver (v1.3.1)
+# Edmentum Solver (v1.4.0)
 
 Automate your Edmentum experience for free. An open-source userscript designed to automate the majority of tasks within the standard Edmentum platform, allowing for a much smoother experience.
 
@@ -12,6 +12,7 @@ Automate your Edmentum experience for free. An open-source userscript designed t
 * **Auto Tutorial:** Automatically navigates through tutorial slides with customizable delays. It skips near the end of tutorials and finishes them automatically.
 * **Auto-Activity & Advance:** Enters the next module and moves through the course automatically.
 * **Background Mode:** Includes an anti-throttle feature to keep the script running normally, even when offtab.
+* **Full Light & Dark Mode:** Choose your preference.
 > ❌ **Note:** This script CANNOT complete projects or teacher-graded activities!
 ---
 
@@ -22,7 +23,7 @@ Automate your Edmentum experience for free. An open-source userscript designed t
 
 ---
 
-## 📸 Preview & Screenshots
+## 📸 Preview & Screenshots (may be outdated, will update soon!)
 
 <details>
 <summary><b>Click to view screenshots</b></summary>
