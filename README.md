@@ -1,52 +1,57 @@
-# Edmentum Solver (v1.4.0)
+# Eclipse (Edmentum Solver) - v1.5.0
 
-Automate your Edmentum experience for free. An open-source userscript designed to automate the majority of tasks within the standard Edmentum platform, allowing for a much smoother experience.
+Automate your Edmentum experience for free. An open-source userscript designed to automate the majority of tasks within the standard Edmentum platform, allowing for a much smoother and automated experience.
 
 [![Greasy Fork](https://img.shields.io/badge/Install%20from-Greasy%20Fork-red?style=for-the-badge)](https://greasyfork.org/en/scripts/578793-edmentum-solver-v1-2-0)
 
 ---
 
+This script is designed to automate the majority of tasks within the standard Edmentum platform, including tutorials and tests. It analyzes multiple question formats and automatically inputs the answers, streamlining your coursework. For tutorials, it can automatically skip near the end to finish them quickly. 
+
+> ❌ **Note:** The script CANNOT complete projects or teacher-graded activities!
+
+---
+
 ## 🚀 Key Features
 
-* **Auto Answer:** Supports Multiple Choice, Multiple Response, Hottext, Drag-and-Drop (GGM), Matching Pairs, and Text Entry.
-* **Auto Tutorial:** Automatically navigates through tutorial slides with customizable delays. It skips near the end of tutorials and finishes them automatically.
-* **Auto-Activity & Advance:** Enters the next module and moves through the course automatically.
-* **Background Mode:** Includes an anti-throttle feature to keep the script running normally, even when offtab.
-* **Full Light & Dark Mode:** Choose your preference.
-> ❌ **Note:** This script CANNOT complete projects or teacher-graded activities!
+* **Auto Tutorial:** Automatically completes tutorials with customizable slide delays.
+* **Auto Answer:** Automatically solves and answers test questions.
+* **Auto-Activity & Advance:** Enters the next module and moves through the course sequence automatically.
+* **Background Mode:** Includes an anti-throttle mechanism to keep the script running even when the tab is not in focus.
+* **Native Multimodal AI Support:** Uses the native vision capabilities of Cerebras Gemma 4 31B to analyze questions containing graphs, diagrams, and images with high accuracy.
+* **Full Light & Dark Mode:** Choose your visual preference in the UI.
+
 ---
 
 ## ⚠️ Compatibility Notice
 
-* **Supported:** Works ONLY on standard Edmentum domains (e.g., `elf.edmentum.com`, `platoweb.com`).
-* **Not Supported:** Will not work on other Edmentum-owned platforms, such as Apex Learning or specific Courseware v2 variants that use different code structures. Support may come in the future, but not anytime soon.
+* **Supported Platforms:** Works **ONLY** on standard Edmentum domains (like `elf.edmentum.com`).
+* **Unsupported Platforms:** Will **NOT** work on other platforms owned by Edmentum, such as Apex Learning or specific Courseware v2 variants that use different web structures. Support may come in the future, but not anytime soon.
 
 ---
 
-## 📸 Preview & Screenshots (may be outdated, will update soon!)
+## 📸 Preview & Screenshots
 
 <details>
 <summary><b>Click to view screenshots</b></summary>
 <br>
 
 ### 1. Features Tab
-<img width="373" height="737" alt="Screenshot 2026-05-21 195919" src="https://github.com/user-attachments/assets/a489b41d-c4a6-4f80-be08-bad31156bd80" />
+<img width="392" height="687" alt="Screenshot 2026-07-05 142924" src="https://github.com/user-attachments/assets/d7bccc00-2c98-4496-b39a-e9f459405baa" />
+
 
 ### 2. API Tab
-<img width="376" height="662" alt="Screenshot 2026-05-21 195930" src="https://github.com/user-attachments/assets/175020ab-1453-4b5b-921b-0797fe542780" />
+<img width="394" height="669" alt="Screenshot 2026-07-05 142941" src="https://github.com/user-attachments/assets/68b00696-f415-48b4-88ec-ab53a7d189a3" />
+
 
 ### 3. About Tab
-
-<img width="370" height="812" alt="Screenshot 2026-05-21 195942" src="https://github.com/user-attachments/assets/487f36e5-6139-4f3a-bf2c-b5a601231c93" />
+<img width="394" height="865" alt="Screenshot 2026-07-05 142951" src="https://github.com/user-attachments/assets/369a61c4-4f1a-42ad-973a-8b007853ea7c" />
 
 ### 4. Auto Answer In Action
-
-<img width="1373" height="837" alt="Screenshot 2026-05-21 200120" src="https://github.com/user-attachments/assets/9d9a39f7-2e07-4e80-9539-14253126073f" />
-
+<img width="1783" height="884" alt="Screenshot 2026-07-05 143422" src="https://github.com/user-attachments/assets/d5fa2772-b644-466f-ab89-11816377ce11" />
 
 ### 5. Test result screen
-<img width="963" height="744" alt="Screenshot 2026-05-21 200154" src="https://github.com/user-attachments/assets/08437802-2e0f-4a88-ac02-bc10d0126668" />
-
+<img width="1781" height="934" alt="Screenshot 2026-07-05 143937" src="https://github.com/user-attachments/assets/a132392c-8c36-437f-b8c1-4c8627ec5a2e" />
 
 </details>
 
@@ -54,10 +59,11 @@ Automate your Edmentum experience for free. An open-source userscript designed t
 
 ## 🛠️ Setup Instructions
 
-1. Install a userscript manager extension like **Tampermonkey** in your browser. (Other script managers MAY work, but have not been tested.)
-2. Click the big red badge at the top of this page (or use [this link](https://greasyfork.org/en/scripts/578793-edmentum-solver-v1-0-0)) to install the script from Greasyfork.
-3. Open any Edmentum activity. A setup modal will appear asking for your API keys. Follow the on-screen instructions to get your keys (they are completely free!).
-4. Once keys are saved, you can apply the recommended settings it gives you if you want, and enjoy the experience!
+1. Make sure you have the **Tampermonkey** browser extension installed.
+2. Click the big red badge at the top of this page (or use [this link](https://greasyfork.org/en/scripts/578793-edmentum-solver-v1-2-0)) to install the script from Greasyfork.
+3. Log in to Edmentum normally.
+4. A setup modal will appear. Input your Cerebras API key (obtainable for free by following the instructions in the UI).
+5. Once your key is saved, you can use the script normally!
 
 ---
 
