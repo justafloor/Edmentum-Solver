@@ -1,23 +1,23 @@
-# Eclipse (Edmentum Solver) - v1.5.0
+# Eclipse (Edmentum Solver) - v1.6.0
 
-Automate your Edmentum experience for free. An open-source userscript designed to automate the majority of tasks within the standard Edmentum platform, allowing for a much smoother and automated experience.
+Automate your Edmentum experience for free. An open-source userscript designed to automate all of the tasks within the standard Edmentum platform, allowing for a smooth, automated experience.
 
 [![Greasy Fork](https://img.shields.io/badge/Install%20from-Greasy%20Fork-red?style=for-the-badge)](https://greasyfork.org/en/scripts/578793-edmentum-solver-v1-2-0)
 
 ---
 
-This script is designed to automate the majority of tasks within the standard Edmentum platform, including tutorials and tests. It analyzes multiple question formats and automatically inputs the answers, streamlining your coursework. For tutorials, it can automatically skip near the end to finish them quickly. 
+This script is designed to automate all of the tasks within the standard Edmentum platform, including tutorials, teacher-graded activities, and tests. It analyzes multiple question types and automatically inputs the answers, automating the process completely. For tutorials, it can automatically skip near the end to finish them quickly. 
 
-> ❌ **Note:** The script CANNOT complete projects or teacher-graded activities!
 
 ---
 
 ## 🚀 Key Features
 
 * **Auto Tutorial:** Automatically completes tutorials with customizable slide delays.
-* **Auto Answer:** Automatically solves and answers test questions.
+* **Auto Answer:** Automatically solves and answers test questions. and can also complete practices if the subsetting for it is enabled.
 * **Auto-Activity & Advance:** Enters the next module and moves through the course sequence automatically.
 * **Background Mode:** Includes an anti-throttle mechanism to keep the script running even when the tab is not in focus.
+* **Auto Teacher Graded:** Automatically completes Teacher Graded Activities, including discussions and unit activities. You can choose to complete discussions, unit activities, or both using the subsettings in the UI.
 * **Native Multimodal AI Support:** Uses the native vision capabilities of Cerebras Gemma 4 31B to analyze questions containing graphs, diagrams, and images with high accuracy.
 * **Full Light & Dark Mode:** Choose your visual preference in the UI.
 
@@ -62,8 +62,8 @@ This script is designed to automate the majority of tasks within the standard Ed
 1. Make sure you have the **Tampermonkey** browser extension installed.
 2. Click the big red badge at the top of this page (or use [this link](https://greasyfork.org/en/scripts/578793-edmentum-solver-v1-2-0)) to install the script from Greasyfork.
 3. Log in to Edmentum normally.
-4. A setup modal will appear. Input your Cerebras API key (obtainable for free by following the instructions in the UI).
-5. Once your key is saved, you can use the script normally!
+4. A setup modal will appear. Input your API keys (obtainable for free by following the instructions in the UI).
+5. Once your keys are saved, you can use the script normally!
 
 ---
 
@@ -85,3 +85,15 @@ If you have any issues, concerns, or questions regarding the script, feel free t
 
 * **Discord:** `justafloor23`
 * **Reddit:** `Ok_Parking_4605`
+
+
+### Additional Info
+
+You can find more info and changelogs on the GreasyFork page.
+https://greasyfork.org/en/scripts/578793-eclipse-edmentum-solver-v1-6-0
+
+
+
+###  ✈️ Vacation Notice
+
+I am going on Vaccation July 19th, and won't be returning for 6 weeks. During that time, I will NOT be able to work on the script. If you encounter any issues or have any questions, contact me, and I'll get to them as soon as I can.
