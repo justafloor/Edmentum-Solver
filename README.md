@@ -1,4 +1,4 @@
-# Eclipse (Edmentum Solver) - v1.6.0
+# Eclipse (Edmentum Solver) - v1.6.1
 
 Automate your Edmentum experience for free. An open-source userscript designed to automate all of the tasks within the standard Edmentum platform, allowing for a smooth, automated experience.
 
